@@ -94,9 +94,9 @@
 | role | varchar(128) | Agent 角色 |
 | system_prompt | text | 系统提示词 |
 | instructions | text | 执行说明 |
-| model_provider | varchar(64) | 模型提供方 |
-| model_name | varchar(128) | 模型名 |
-| model_config_json | jsonb | 模型附加配置 |
+| model_provider | varchar(64) | 模型提供方，例如 `openai` / `openai-compatible` |
+| model_name | varchar(128) | 模型名，允许 Agent 级覆盖系统默认模型 |
+| model_config_json | jsonb | 模型附加配置，例如 temperature、max_tokens |
 | input_schema_json | jsonb | 输入契约 |
 | output_schema_json | jsonb | 输出契约 |
 | tool_ids_json | jsonb | 已绑定工具 IDs |
@@ -109,6 +109,12 @@
 | updated_at | timestamptz | 更新时间 |
 
 这里把常用查询字段拆出来，不把整个 Agent 配置都藏进 JSON。
+
+补充约定：
+
+- `base_url` 不落表，统一走后端系统配置
+- `api_key` 不落表，统一走环境变量或后续密钥管理
+- Agent 只声明使用哪个 provider、model 和推理参数
 
 ## 7. skills
 

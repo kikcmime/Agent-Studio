@@ -114,7 +114,44 @@ class FlowRunner:
                         payload={"node_id": node.id, "agent_id": agent.id},
                     )
                 )
-                output = agent_runner.run(agent, resolved_input)
+                try:
+                    output = agent_runner.run(agent, resolved_input)
+                except Exception as exc:
+                    failed_at = utcnow()
+                    steps.append(
+                        RunStepResult(
+                            id=f"step_{uuid4().hex[:10]}",
+                            node_id=node.id,
+                            node_type=node.type,
+                            status=StepStatus.FAILED,
+                            started_at=started_at,
+                            finished_at=failed_at,
+                            input=resolved_input,
+                            output={},
+                            error=str(exc),
+                        )
+                    )
+                    events.append(
+                        RunEvent(
+                            id=f"event_{uuid4().hex[:10]}",
+                            run_id=run_id,
+                            event_type="step.failed",
+                            created_at=failed_at,
+                            payload={"node_id": node.id, "error": str(exc)},
+                        )
+                    )
+                    return RunDetail(
+                        id=run_id,
+                        flow_id=flow_id,
+                        flow_version=flow.latest_version,
+                        status=RunStatus.FAILED,
+                        input=request.input,
+                        output={},
+                        started_at=now,
+                        finished_at=failed_at,
+                        steps=steps,
+                        events=events,
+                    )
                 finished_at = utcnow()
                 output_key = node.data.output_mapping or {node.id: "{{output}}"}
                 runtime_context["steps"][node.id] = output

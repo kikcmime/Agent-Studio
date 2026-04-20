@@ -145,6 +145,32 @@ Agent 不直接拥有复杂能力实现，只维护绑定关系：
 7. 校验结构化输出
 8. 落库到 run_steps
 
+模型配置约定固定为：
+
+- Agent 只保存 `provider`、`model` 和推理参数
+- `base_url` 不存在 Agent 表里，统一走后端系统配置
+- `api_key` 不存在 Agent 表里，统一走环境变量或后续密钥表
+
+v1 先支持两类 provider：
+
+- `openai`
+- `openai-compatible`
+
+对应环境变量建议固定为：
+
+- `OPENAI_BASE_URL`
+- `OPENAI_API_KEY`
+- `OPENAI_DEFAULT_MODEL`
+- `OPENAI_COMPATIBLE_BASE_URL`
+- `OPENAI_COMPATIBLE_API_KEY`
+- `OPENAI_COMPATIBLE_DEFAULT_MODEL`
+
+这样做的好处是：
+
+- 前端不用处理密钥
+- Agent 配置可以安全复用
+- 切换模型服务时不需要批量改数据库
+
 关键点不在于把所有能力都做复杂，而在于输出统一：
 
 ```py

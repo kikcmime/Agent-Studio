@@ -50,6 +50,35 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
+cp .env.example .env
+```
+
+## 模型配置
+
+Agent 只保存：
+
+- `provider`
+- `model`
+- 推理参数，例如 `temperature`
+
+以下敏感或系统级配置不落 Agent 表：
+
+- `base_url`
+- `api_key`
+
+当前支持的环境变量如下：
+
+```bash
+DEFAULT_LLM_PROVIDER=openai-compatible
+LLM_TIMEOUT_SECONDS=120
+
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=
+OPENAI_DEFAULT_MODEL=gpt-4.1-mini
+
+OPENAI_COMPATIBLE_BASE_URL=https://kspmas.ksyun.com/v1
+OPENAI_COMPATIBLE_API_KEY=
+OPENAI_COMPATIBLE_DEFAULT_MODEL=deepseek-v3.1-ksyun
 ```
 
 ## 本地运行
@@ -79,12 +108,19 @@ Agent-Studio/
   docs/
     backend/
   requirements.txt
+  .env.example
 ```
 
 ## 当前已有内容
 
 - `app/main.py`
-  最小 FastAPI 入口和 demo 接口
+  FastAPI 入口和 API 路由注册
+
+- `app/runners/flow_runner.py`
+  最小编排执行器，支持 Start/Agent/Condition/End
+
+- `app/runners/agent_runner.py`
+  Agent 节点执行器，已接入 OpenAI-compatible LLM 调用
 
 - `app/schemas/contracts.py`
   Flow、Agent、Run 等协议模型
@@ -100,16 +136,6 @@ Agent-Studio/
 
 - `docs/backend/database-schema-v1.md`
   第一版 PostgreSQL 表设计
-
-## 第一版要做的东西
-
-这个仓库接下来优先做：
-
-1. `flows / agents / runs` 三组最小 CRUD
-2. FlowVersion 的保存与读取
-3. 串行 Flow Runner
-4. Condition 分支执行
-5. Run 和 RunStep 轨迹记录
 
 ## 文档
 
