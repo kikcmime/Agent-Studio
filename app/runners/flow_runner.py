@@ -375,14 +375,21 @@ class FlowRunner:
         node_id: str,
         edges_by_source: dict[str, list[FlowEdge]],
         node_map: dict[str, Any],
-        branch: bool | None = None,
+        branch: str | None = None,
     ):
         edges = edges_by_source.get(node_id) or []
         if not edges:
             return None
 
+        # 如果有分支ID，优先匹配分支
         if branch is not None:
-            preferred_handles = ["true", "false"] if branch else ["false", "true"]
+            # 先尝试匹配 branch_id
+            for edge in edges:
+                edge_branch = edge.data.get("branch") if edge.data else None
+                if edge_branch == branch:
+                    return node_map.get(edge.target)
+            # 兼容旧逻辑：匹配 true/false
+            preferred_handles = ["true", "false"] if branch in ("true", True) else ["false", "true"]
             for handle in preferred_handles:
                 for edge in edges:
                     edge_handle = (edge.source_handle or edge.data.get("branch") or "").lower()
@@ -429,26 +436,94 @@ class FlowRunner:
             return current
         return runtime_context.get(expression)
 
-    def _evaluate_condition(self, node: ConditionNode, runtime_context: dict) -> bool:
-        rule = node.data.condition
-        actual = self._resolve_context_value(rule.field, runtime_context)
-        expected = rule.value
+    def _evaluate_condition(self, node: ConditionNode, runtime_context: dict) -> str:
+        """评估条件节点，返回匹配的分支ID"""
+        data = node.data
+        condition_type = data.condition_type or "simple"
 
-        if rule.operator == "eq":
+        # 获取输入值
+        input_value = self._resolve_context_value(
+            data.input_source.replace("{{", "").replace("}}", ""),
+            runtime_context
+        )
+
+        # 简单条件（兼容旧版本）
+        if condition_type == "simple" and data.condition:
+            rule = data.condition
+            actual = self._resolve_context_value(rule.field, runtime_context)
+            expected = rule.value
+            matched = self._match_simple_condition(actual, expected, rule.operator)
+            return "true" if matched else "false"
+
+        # 表达式条件
+        if condition_type == "expression" and data.expression:
+            # 简单表达式求值（替换变量后比较）
+            expr = data.expression
+            # 替换 {{xxx}} 变量
+            import re
+            def replace_var(m):
+                var_path = m.group(1).strip()
+                return str(self._resolve_context_value(var_path, runtime_context) or "")
+            expr = re.sub(r'\{\{([^}]+)\}\}', replace_var, expr)
+            try:
+                # 安全求值：只支持基本比较
+                matched = eval(expr, {"__builtins__": {}}, {})
+                return "true" if matched else "false"
+            except:
+                return data.default_branch_id or "false"
+
+        # LLM 分类
+        if condition_type == "llm_classify" and data.llm_config:
+            config = data.llm_config
+            # 简化实现：返回第一个匹配的类别（实际应调用 LLM）
+            categories = config.categories or []
+            for branch in data.branches:
+                if branch.condition_value in categories:
+                    return branch.id
+            return data.default_branch_id or (data.branches[0].id if data.branches else "false")
+
+        # 正则匹配
+        if condition_type == "regex" and data.regex_patterns:
+            import re
+            text = str(input_value or "")
+            for pattern_obj in data.regex_patterns:
+                try:
+                    if re.search(pattern_obj.pattern, text):
+                        return pattern_obj.branch_id
+                except re.error:
+                    continue
+            return data.default_branch_id or "false"
+
+        # JSON Schema 校验
+        if condition_type == "json_schema" and data.json_schema:
+            # 简化实现：只检查必需字段是否存在
+            schema = data.json_schema
+            required = schema.get("required", [])
+            if isinstance(input_value, dict):
+                missing = [f for f in required if f not in input_value]
+                return "valid" if not missing else "invalid"
+            return "invalid"
+
+        # 默认走第一个分支
+        return data.default_branch_id or (data.branches[0].id if data.branches else "true")
+
+    def _match_simple_condition(self, actual, expected, operator: str) -> bool:
+        """简单条件匹配"""
+        if operator == "eq":
             return actual == expected
-        if rule.operator == "ne":
+        if operator == "ne":
             return actual != expected
-        if rule.operator == "contains":
+        if operator == "contains":
             return expected in actual if actual is not None else False
-        if rule.operator == "gt":
-            return actual > expected
-        if rule.operator == "gte":
-            return actual >= expected
-        if rule.operator == "lt":
-            return actual < expected
-        if rule.operator == "lte":
-            return actual <= expected
-        if rule.operator == "exists":
+        if operator == "gt":
+            return actual > expected if actual is not None else False
+        if operator == "gte":
+            return actual >= expected if actual is not None else False
+        if operator == "lt":
+            return actual < expected if actual is not None else False
+        if operator == "lte":
+            return actual <= expected if actual is not None else False
+        if operator == "exists":
             return actual is not None
         return False
 

@@ -59,6 +59,28 @@ class ConditionRule(BaseModel):
     value: Any
 
 
+class ConditionBranch(BaseModel):
+    """条件分支定义"""
+    id: str
+    label: str
+    condition_value: str | None = None
+    target_node_id: str | None = None
+
+
+class LLMClassifyConfig(BaseModel):
+    """LLM分类配置"""
+    model: str = "gpt-4.1-mini"
+    prompt: str | None = None
+    categories: list[str] = Field(default_factory=list)
+    output_key: str = "category"
+
+
+class RegexPattern(BaseModel):
+    """正则匹配模式"""
+    pattern: str
+    branch_id: str
+
+
 class StartNodeData(BaseModel):
     label: str | None = None
 
@@ -85,7 +107,21 @@ class TeamNodeData(BaseModel):
 
 class ConditionNodeData(BaseModel):
     label: str
-    condition: ConditionRule
+    condition_type: Literal["expression", "llm_classify", "regex", "json_schema", "simple"] = "simple"
+    input_source: str = "{{input.user_message}}"
+
+    # 不同条件类型的配置
+    expression: str | None = None
+    llm_config: LLMClassifyConfig | None = None
+    regex_patterns: list[RegexPattern] = Field(default_factory=list)
+    json_schema: dict[str, Any] = Field(default_factory=dict)
+
+    # 分支配置
+    branches: list[ConditionBranch] = Field(default_factory=list)
+    default_branch_id: str | None = None
+
+    # 兼容旧版本的简单条件
+    condition: ConditionRule | None = None
 
 
 class EndNodeData(BaseModel):
