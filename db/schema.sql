@@ -40,11 +40,14 @@ create table if not exists agents (
   input_schema_json jsonb not null default '{}'::jsonb,
   output_schema_json jsonb not null default '{}'::jsonb,
   tool_ids_json jsonb not null default '[]'::jsonb,
+  skill_ids_json jsonb not null default '[]'::jsonb,
   knowledge_ids_json jsonb not null default '[]'::jsonb,
   timeout_seconds integer not null default 120,
   retry_policy_json jsonb not null default '{"max_retries": 1, "retry_backoff_seconds": 3}'::jsonb,
   version integer not null default 1,
   status varchar(32) not null default 'active',
+  stream boolean not null default false,
+  debug boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -131,7 +134,7 @@ create table if not exists run_steps (
 );
 
 create table if not exists run_events (
-  id bigserial primary key,
+  id varchar(64) primary key,
   run_id varchar(64) not null references runs(id),
   run_step_id varchar(64),
   event_type varchar(64) not null,

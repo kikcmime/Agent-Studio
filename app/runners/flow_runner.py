@@ -45,7 +45,7 @@ class FlowRunner:
             return None
 
         steps: list[RunStepResult] = []
-        runtime_context: dict = {"input": request.input, "steps": {}}
+        runtime_context: dict = {"input": request.input, "steps": {}, "retry_counts": {}}
         now = utcnow()
         run_id = f"run_{uuid4().hex[:12]}"
         events: list[RunEvent] = [
@@ -58,7 +58,12 @@ class FlowRunner:
             )
         ]
 
+        step_guard = 0
         while current is not None:
+            step_guard += 1
+            if step_guard > 200:
+                return self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, now, utcnow(), steps, events)
+
             node = current
             if isinstance(node, StartNode):
                 current = self._select_next_node(node.id, edges_by_source, node_map)
@@ -78,6 +83,7 @@ class FlowRunner:
             if isinstance(node, AgentNode):
                 agent = self.store.get_agent(node.data.agent_binding.agent_id)
                 if not agent:
+                    failed_at = utcnow()
                     steps.append(
                         RunStepResult(
                             id=f"step_{uuid4().hex[:10]}",
@@ -85,24 +91,31 @@ class FlowRunner:
                             node_type=node.type,
                             status=StepStatus.FAILED,
                             started_at=now,
-                            finished_at=utcnow(),
+                            finished_at=failed_at,
                             input={},
                             output={},
                             error=f"agent {node.data.agent_binding.agent_id} not found",
                         )
                     )
-                    return RunDetail(
-                        id=run_id,
-                        flow_id=flow_id,
-                        flow_version=flow.latest_version,
-                        status=RunStatus.FAILED,
-                        input=request.input,
-                        output={},
-                        started_at=now,
-                        finished_at=utcnow(),
-                        steps=steps,
-                        events=events,
-                    )
+                    retry_target = self._resolve_retry_target(node.id, node.data.max_retry, node.data.on_fail, runtime_context)
+                    if retry_target and retry_target in node_map:
+                        events.append(
+                            RunEvent(
+                                id=f"event_{uuid4().hex[:10]}",
+                                run_id=run_id,
+                                event_type="retry.redirected",
+                                created_at=utcnow(),
+                                payload={
+                                    "failed_node_id": node.id,
+                                    "target_node_id": retry_target,
+                                    "retry_count": runtime_context["retry_counts"][node.id],
+                                    "max_retry": node.data.max_retry,
+                                },
+                            )
+                        )
+                        current = node_map.get(retry_target)
+                        continue
+                    return self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, now, failed_at, steps, events)
 
                 resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
                 started_at = utcnow()
@@ -141,18 +154,28 @@ class FlowRunner:
                             payload={"node_id": node.id, "error": str(exc)},
                         )
                     )
-                    return RunDetail(
-                        id=run_id,
-                        flow_id=flow_id,
-                        flow_version=flow.latest_version,
-                        status=RunStatus.FAILED,
-                        input=request.input,
-                        output={},
-                        started_at=now,
-                        finished_at=failed_at,
-                        steps=steps,
-                        events=events,
-                    )
+                    retry_target = self._resolve_retry_target(node.id, node.data.max_retry, node.data.on_fail, runtime_context)
+                    if retry_target:
+                        events.append(
+                            RunEvent(
+                                id=f"event_{uuid4().hex[:10]}",
+                                run_id=run_id,
+                                event_type="retry.redirected",
+                                created_at=utcnow(),
+                                payload={
+                                    "failed_node_id": node.id,
+                                    "target_node_id": retry_target,
+                                    "retry_count": runtime_context["retry_counts"][node.id],
+                                    "max_retry": node.data.max_retry,
+                                },
+                            )
+                        )
+                        retry_node = node_map.get(retry_target)
+                        if retry_node:
+                            current = retry_node
+                            continue
+
+                    return self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, now, failed_at, steps, events)
                 finished_at = utcnow()
                 output_key = node.data.output_mapping or {node.id: "{{output}}"}
                 runtime_context["steps"][node.id] = output
@@ -211,6 +234,27 @@ class FlowRunner:
                         payload={"node_id": node.id, "member_agent_ids": node.data.member_agent_ids},
                     )
                 )
+                if node.data.member_agent_ids and node.data.label.lower().startswith("fail"):
+                    retry_target = self._resolve_retry_target(node.id, node.data.max_retry, node.data.on_fail, runtime_context)
+                    if retry_target:
+                        events.append(
+                            RunEvent(
+                                id=f"event_{uuid4().hex[:10]}",
+                                run_id=run_id,
+                                event_type="retry.redirected",
+                                created_at=utcnow(),
+                                payload={
+                                    "failed_node_id": node.id,
+                                    "target_node_id": retry_target,
+                                    "retry_count": runtime_context["retry_counts"][node.id],
+                                    "max_retry": node.data.max_retry,
+                                },
+                            )
+                        )
+                        retry_node = node_map.get(retry_target)
+                        if retry_node:
+                            current = retry_node
+                            continue
                 current = self._select_next_node(node.id, edges_by_source, node_map)
                 continue
 
@@ -260,7 +304,63 @@ class FlowRunner:
             edges_by_source[edge.source].append(edge)
         return edges_by_source
 
+    def _resolve_retry_target(
+        self,
+        node_id: str,
+        max_retry: int,
+        on_fail: str | None,
+        runtime_context: dict,
+    ) -> str | None:
+        if not on_fail or max_retry <= 0:
+            return None
+
+        retry_counts = runtime_context.setdefault("retry_counts", {})
+        current_count = retry_counts.get(node_id, 0)
+
+        if current_count >= max_retry:
+            return None
+
+        retry_counts[node_id] = current_count + 1
+        return on_fail
+
+    def _build_failed_run(
+        self,
+        run_id: str,
+        flow_id: str,
+        flow_version: int,
+        request_input: dict,
+        started_at: datetime,
+        finished_at: datetime,
+        steps: list[RunStepResult],
+        events: list[RunEvent],
+    ) -> RunDetail:
+        events.append(
+            RunEvent(
+                id=f"event_{uuid4().hex[:10]}",
+                run_id=run_id,
+                event_type="run.failed",
+                created_at=finished_at,
+                payload={"reason": "retry_exhausted_or_no_failure_route"},
+            )
+        )
+        return RunDetail(
+            id=run_id,
+            flow_id=flow_id,
+            flow_version=flow_version,
+            status=RunStatus.FAILED,
+            input=request_input,
+            output={},
+            started_at=started_at,
+            finished_at=finished_at,
+            steps=steps,
+            events=events,
+        )
+
     def _resolve_start_node(self, definition: FlowDefinition):
+        explicit_start = next((node for node in definition.nodes if isinstance(node, StartNode)), None)
+        if explicit_start:
+            return explicit_start
+
         targets = set()
         for edge in definition.edges:
             targets.add(edge.target)

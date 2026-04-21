@@ -1,11 +1,18 @@
 from app.core.config import settings
 from app.repositories.in_memory import InMemoryStore, store
+from app.repositories.postgres import PostgresStore
 
 
-def get_store() -> InMemoryStore:
+postgres_store: PostgresStore | None = None
+
+
+def get_store() -> InMemoryStore | PostgresStore:
+    global postgres_store
+
     if settings.storage_backend == "postgres":
-        # PostgreSQL repository wiring will be added in the next phase.
-        # For now, fall back to the in-memory implementation to keep the app usable.
-        return store
+        if not settings.postgres_dsn:
+            raise RuntimeError("POSTGRES_DSN is required when STORAGE_BACKEND=postgres")
+        if postgres_store is None:
+            postgres_store = PostgresStore(settings.postgres_dsn)
+        return postgres_store
     return store
-

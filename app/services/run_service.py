@@ -9,7 +9,10 @@ class RunService:
         result = flow_runner.run_flow(flow_id, request)
         if result is None:
             return None
-        store.runs[result.id] = result
+        if hasattr(store, "save_run"):
+            store.save_run(result)
+        else:
+            store.runs[result.id] = result
         return RunSummary(
             id=result.id,
             flow_id=result.flow_id,

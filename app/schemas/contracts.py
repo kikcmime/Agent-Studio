@@ -68,6 +68,8 @@ class AgentNodeData(BaseModel):
     agent_binding: AgentBinding
     input_mapping: dict[str, Any] = Field(default_factory=dict)
     output_mapping: dict[str, Any] = Field(default_factory=dict)
+    max_retry: int = 0
+    on_fail: str | None = None
 
 
 class TeamNodeData(BaseModel):
@@ -77,6 +79,8 @@ class TeamNodeData(BaseModel):
     strategy: Literal["parallel", "sequential"] = "parallel"
     input_mapping: dict[str, Any] = Field(default_factory=dict)
     output_mapping: dict[str, Any] = Field(default_factory=dict)
+    max_retry: int = 0
+    on_fail: str | None = None
 
 
 class ConditionNodeData(BaseModel):
@@ -272,6 +276,13 @@ class RunStepResult(BaseModel):
 
 
 class RunCreateRequest(BaseModel):
+    input: dict[str, Any] = Field(default_factory=dict)
+    user_id: str | None = None
+    session_id: str | None = None
+    stream: bool = False
+
+
+class AgentRunCreateRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     user_id: str | None = None
     session_id: str | None = None
