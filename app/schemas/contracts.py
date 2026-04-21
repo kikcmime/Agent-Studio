@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T")
 
@@ -70,6 +70,15 @@ class AgentNodeData(BaseModel):
     output_mapping: dict[str, Any] = Field(default_factory=dict)
 
 
+class TeamNodeData(BaseModel):
+    label: str
+    description: str | None = None
+    member_agent_ids: list[str] = Field(default_factory=list)
+    strategy: Literal["parallel", "sequential"] = "parallel"
+    input_mapping: dict[str, Any] = Field(default_factory=dict)
+    output_mapping: dict[str, Any] = Field(default_factory=dict)
+
+
 class ConditionNodeData(BaseModel):
     label: str
     condition: ConditionRule
@@ -93,6 +102,13 @@ class AgentNode(BaseModel):
     data: AgentNodeData
 
 
+class TeamNode(BaseModel):
+    id: str
+    type: Literal["team"]
+    position: Position
+    data: TeamNodeData
+
+
 class ConditionNode(BaseModel):
     id: str
     type: Literal["condition"]
@@ -107,7 +123,7 @@ class EndNode(BaseModel):
     data: EndNodeData = Field(default_factory=EndNodeData)
 
 
-FlowNode = StartNode | AgentNode | ConditionNode | EndNode
+FlowNode = StartNode | AgentNode | TeamNode | ConditionNode | EndNode
 
 
 class FlowEdge(BaseModel):
@@ -145,15 +161,20 @@ class AgentSummary(BaseModel):
     workspace_id: str | None = None
     role: str | None = None
     status: str = "active"
+    stream: bool = False
+    debug: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
 
 class AgentDetail(AgentSummary):
+    model_config = ConfigDict(populate_by_name=True)
+
     system_prompt: str | None = None
     instructions: str | None = None
-    model_config: ModelConfig
+    llm_config: ModelConfig = Field(alias="model_config")
     tool_ids: list[str] = Field(default_factory=list)
+    skill_ids: list[str] = Field(default_factory=list)
     knowledge_ids: list[str] = Field(default_factory=list)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
@@ -163,6 +184,8 @@ class AgentDetail(AgentSummary):
 
 
 class AgentCreateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str
     description: str | None = None
     role: str | None = None
@@ -171,28 +194,36 @@ class AgentCreateRequest(BaseModel):
     source_type: AgentSourceType = AgentSourceType.USER_DEFINED
     owner_user_id: str | None = None
     workspace_id: str | None = None
-    model_config: ModelConfig
+    llm_config: ModelConfig = Field(alias="model_config")
     tool_ids: list[str] = Field(default_factory=list)
+    skill_ids: list[str] = Field(default_factory=list)
     knowledge_ids: list[str] = Field(default_factory=list)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int = 120
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    stream: bool = False
+    debug: bool = False
 
 
 class AgentUpdateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str | None = None
     description: str | None = None
     role: str | None = None
     system_prompt: str | None = None
     instructions: str | None = None
-    model_config: ModelConfig | None = None
+    llm_config: ModelConfig | None = Field(default=None, alias="model_config")
     tool_ids: list[str] | None = None
+    skill_ids: list[str] | None = None
     knowledge_ids: list[str] | None = None
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
     timeout_seconds: int | None = None
     retry_policy: RetryPolicy | None = None
+    stream: bool | None = None
+    debug: bool | None = None
     status: str | None = None
 
 

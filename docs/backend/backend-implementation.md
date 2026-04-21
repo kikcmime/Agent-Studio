@@ -280,7 +280,7 @@ source .venv/bin/activate
 
 ```bash
 pip install -e .
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --port 7000
 python -m py_compile app/main.py app/schemas/contracts.py
 ```
 

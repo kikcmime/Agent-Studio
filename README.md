@@ -86,7 +86,7 @@ OPENAI_COMPATIBLE_DEFAULT_MODEL=deepseek-v3.1-ksyun
 ```bash
 cd /Users/wtf/Desktop/agent-studio/Agent-Studio
 source .venv/bin/activate
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --port 7000
 ```
 
 如果后面需要按可编辑模式安装，也可以使用：

@@ -51,9 +51,10 @@ def build_messages(agent: AgentDetail, resolved_input: dict[str, Any]) -> list[d
 
 
 def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict[str, Any]:
-    provider = _normalize_provider(agent.model_config.provider)
+    llm_config = agent.llm_config
+    provider = _normalize_provider(llm_config.provider)
     base_url, api_key, default_model = _resolve_provider_runtime(provider)
-    model_name = agent.model_config.model or default_model
+    model_name = llm_config.model or default_model
 
     if not model_name:
         raise LLMConfigurationError(
@@ -76,11 +77,11 @@ def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict
         "messages": build_messages(agent, resolved_input),
     }
 
-    if agent.model_config.temperature is not None:
-        request_kwargs["temperature"] = agent.model_config.temperature
+    if llm_config.temperature is not None:
+        request_kwargs["temperature"] = llm_config.temperature
 
-    if "max_tokens" in agent.model_config.extra:
-        request_kwargs["max_tokens"] = agent.model_config.extra["max_tokens"]
+    if "max_tokens" in llm_config.extra:
+        request_kwargs["max_tokens"] = llm_config.extra["max_tokens"]
 
     response = client.chat.completions.create(**request_kwargs)
     choice = response.choices[0] if response.choices else None

@@ -20,6 +20,7 @@ from app.schemas.contracts import (
     RunStepResult,
     StartNode,
     StepStatus,
+    TeamNode,
 )
 
 
@@ -174,6 +175,40 @@ class FlowRunner:
                         event_type="step.completed",
                         created_at=finished_at,
                         payload={"node_id": node.id, "output": output},
+                    )
+                )
+                current = self._select_next_node(node.id, edges_by_source, node_map)
+                continue
+
+            if isinstance(node, TeamNode):
+                started_at = utcnow()
+                resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
+                team_output = {
+                    "mode": "team_placeholder",
+                    "strategy": node.data.strategy,
+                    "member_agent_ids": node.data.member_agent_ids,
+                    "message": "Team node execution placeholder. Parallel child execution will be implemented in the orchestrator layer.",
+                }
+                runtime_context["steps"][node.id] = team_output
+                steps.append(
+                    RunStepResult(
+                        id=f"step_{uuid4().hex[:10]}",
+                        node_id=node.id,
+                        node_type=node.type,
+                        status=StepStatus.COMPLETED,
+                        started_at=started_at,
+                        finished_at=utcnow(),
+                        input=resolved_input,
+                        output={"result": team_output},
+                    )
+                )
+                events.append(
+                    RunEvent(
+                        id=f"event_{uuid4().hex[:10]}",
+                        run_id=run_id,
+                        event_type="team.placeholder.completed",
+                        created_at=utcnow(),
+                        payload={"node_id": node.id, "member_agent_ids": node.data.member_agent_ids},
                     )
                 )
                 current = self._select_next_node(node.id, edges_by_source, node_map)
