@@ -52,6 +52,20 @@ create table if not exists agents (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists teams (
+  id varchar(64) primary key,
+  name varchar(255) not null,
+  description text,
+  owner_user_id varchar(64),
+  workspace_id varchar(64),
+  strategy varchar(32) not null default 'parallel',
+  member_agent_ids_json jsonb not null default '[]'::jsonb,
+  status varchar(32) not null default 'active',
+  version integer not null default 1,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists skills (
   id varchar(64) primary key,
   name varchar(255) not null,
@@ -159,6 +173,8 @@ create index if not exists idx_flows_owner_updated_at on flows(owner_user_id, up
 create index if not exists idx_flow_versions_flow_version on flow_versions(flow_id, version desc);
 create index if not exists idx_agents_owner_updated_at on agents(owner_user_id, updated_at desc);
 create index if not exists idx_agents_workspace_updated_at on agents(workspace_id, updated_at desc);
+create index if not exists idx_teams_owner_updated_at on teams(owner_user_id, updated_at desc);
+create index if not exists idx_teams_workspace_updated_at on teams(workspace_id, updated_at desc);
 create index if not exists idx_resources_type_status on resources(type, status);
 create index if not exists idx_runs_flow_created_at on runs(flow_id, created_at desc);
 create index if not exists idx_runs_status_created_at on runs(status, created_at desc);

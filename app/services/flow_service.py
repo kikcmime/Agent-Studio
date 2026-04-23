@@ -1,5 +1,5 @@
 from app.repositories.factory import get_store
-from app.schemas.contracts import FlowCreateRequest, FlowSummary, FlowVersionDetail
+from app.schemas.contracts import FlowCreateRequest, FlowSummary, FlowUpdateRequest, FlowVersionDetail
 
 
 class FlowService:
@@ -14,6 +14,10 @@ class FlowService:
     def create_flow(self, request: FlowCreateRequest) -> FlowVersionDetail:
         store = get_store()
         return store.create_flow(request)
+
+    def update_flow(self, flow_id: str, request: FlowUpdateRequest) -> FlowVersionDetail | None:
+        store = get_store()
+        return store.update_flow(flow_id, request)
 
 
 flow_service = FlowService()

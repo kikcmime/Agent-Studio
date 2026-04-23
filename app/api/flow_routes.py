@@ -6,6 +6,7 @@ from app.schemas.contracts import (
     FlowCreateRequest,
     FlowDefinition,
     FlowSummary,
+    FlowUpdateRequest,
     FlowVersionDetail,
     SuccessResponse,
 )
@@ -33,6 +34,18 @@ def create_flow(request: FlowCreateRequest) -> SuccessResponse[FlowVersionDetail
     return SuccessResponse(data=flow_service.create_flow(request))
 
 
+@router.put(
+    "/flows/{flow_id}",
+    response_model=SuccessResponse[FlowVersionDetail],
+    responses={404: {"model": ErrorResponse}},
+)
+def update_flow(flow_id: str, request: FlowUpdateRequest) -> SuccessResponse[FlowVersionDetail]:
+    flow = flow_service.update_flow(flow_id, request)
+    if not flow:
+        raise HTTPException(status_code=404, detail=ErrorPayload(code="flow_not_found", message="flow not found").model_dump())
+    return SuccessResponse(data=flow)
+
+
 @router.get(
     "/flows/{flow_id}",
     response_model=SuccessResponse[FlowVersionDetail],
@@ -55,4 +68,3 @@ def get_latest_flow_version(flow_id: str) -> SuccessResponse[FlowDefinition]:
     if not flow:
         raise HTTPException(status_code=404, detail=ErrorPayload(code="flow_not_found", message="flow not found").model_dump())
     return SuccessResponse(data=flow.definition, meta={"flow_id": flow_id, "version": flow.latest_version})
-

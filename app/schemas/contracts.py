@@ -15,6 +15,11 @@ class FlowStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class FlowType(StrEnum):
+    AGENT = "agent"
+    TEAM = "team"
+
+
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -96,6 +101,7 @@ class AgentNodeData(BaseModel):
 
 class TeamNodeData(BaseModel):
     label: str
+    team_id: str | None = None
     description: str | None = None
     member_agent_ids: list[str] = Field(default_factory=list)
     strategy: Literal["parallel", "sequential"] = "parallel"
@@ -267,6 +273,42 @@ class AgentUpdateRequest(BaseModel):
     status: str | None = None
 
 
+class TeamSummary(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    owner_user_id: str | None = None
+    workspace_id: str | None = None
+    strategy: Literal["parallel", "sequential"] = "parallel"
+    member_agent_ids: list[str] = Field(default_factory=list)
+    status: str = "active"
+    version: int = 1
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class TeamCreateRequest(BaseModel):
+    name: str
+    description: str | None = None
+    owner_user_id: str | None = None
+    workspace_id: str | None = None
+    strategy: Literal["parallel", "sequential"] = "parallel"
+    member_agent_ids: list[str] = Field(default_factory=list)
+    status: str = "active"
+
+
+class TeamUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    strategy: Literal["parallel", "sequential"] | None = None
+    member_agent_ids: list[str] | None = None
+    status: str | None = None
+
+
+class TeamDetail(TeamSummary):
+    pass
+
+
 class ResourceSummary(BaseModel):
     id: str
     name: str
@@ -279,6 +321,7 @@ class FlowSummary(BaseModel):
     id: str
     name: str
     description: str | None = None
+    flow_type: FlowType = FlowType.AGENT
     owner_user_id: str | None = None
     workspace_id: str | None = None
     status: FlowStatus = FlowStatus.DRAFT
@@ -290,9 +333,18 @@ class FlowSummary(BaseModel):
 class FlowCreateRequest(BaseModel):
     name: str
     description: str | None = None
+    flow_type: FlowType = FlowType.AGENT
     owner_user_id: str | None = None
     workspace_id: str | None = None
     definition: FlowDefinition
+
+
+class FlowUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    flow_type: FlowType | None = None
+    definition: FlowDefinition | None = None
+    status: FlowStatus | None = None
 
 
 class FlowVersionDetail(FlowSummary):

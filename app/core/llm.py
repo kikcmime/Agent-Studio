@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 from openai import OpenAI
@@ -43,6 +44,14 @@ def build_messages(agent: AgentDetail, resolved_input: dict[str, Any]) -> list[d
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
+    for item in resolved_input.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": str(content)})
+
     user_message = resolved_input.get("user_message") or resolved_input.get("query")
     if not user_message:
         user_message = json.dumps(resolved_input, ensure_ascii=False, indent=2)
@@ -50,7 +59,7 @@ def build_messages(agent: AgentDetail, resolved_input: dict[str, Any]) -> list[d
     return messages
 
 
-def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict[str, Any]:
+def _build_request(agent: AgentDetail, resolved_input: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     llm_config = agent.llm_config
     provider = _normalize_provider(llm_config.provider)
     base_url, api_key, default_model = _resolve_provider_runtime(provider)
@@ -83,6 +92,13 @@ def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict
     if "max_tokens" in llm_config.extra:
         request_kwargs["max_tokens"] = llm_config.extra["max_tokens"]
 
+    return provider, model_name, {"client": client, "kwargs": request_kwargs}
+
+
+def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict[str, Any]:
+    provider, model_name, request = _build_request(agent, resolved_input)
+    client = request["client"]
+    request_kwargs = request["kwargs"]
     response = client.chat.completions.create(**request_kwargs)
     choice = response.choices[0] if response.choices else None
     message = ""
@@ -120,4 +136,40 @@ def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict
         "normalized_task": (resolved_input.get("user_message") or resolved_input.get("query") or "")[:120],
         "finish_reason": finish_reason,
         "usage": usage,
+    }
+
+
+def stream_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    provider, model_name, request = _build_request(agent, resolved_input)
+    client = request["client"]
+    request_kwargs = {**request["kwargs"], "stream": True}
+    message_parts: list[str] = []
+    finish_reason = None
+
+    for chunk in client.chat.completions.create(**request_kwargs):
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+        delta = getattr(choice.delta, "content", None)
+        if not delta:
+            continue
+        message_parts.append(delta)
+        yield {"type": "delta", "delta": delta}
+
+    message = "".join(message_parts)
+    yield {
+        "type": "completed",
+        "output": {
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "provider": provider,
+            "model": model_name,
+            "message": message,
+            "echo_input": resolved_input,
+            "normalized_task": (resolved_input.get("user_message") or resolved_input.get("query") or "")[:120],
+            "finish_reason": finish_reason,
+            "usage": None,
+        },
     }

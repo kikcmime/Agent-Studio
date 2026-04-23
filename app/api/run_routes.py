@@ -15,6 +15,7 @@ from app.schemas.contracts import (
     SuccessResponse,
 )
 from app.services.run_service import run_service
+from app.runners.flow_runner import flow_runner
 
 router = APIRouter(tags=["runs"])
 
@@ -55,15 +56,10 @@ def create_run(flow_id: str, request: RunCreateRequest) -> SuccessResponse[RunSu
     responses={404: {"model": ErrorResponse}},
 )
 def stream_flow_run(flow_id: str, request: RunCreateRequest) -> StreamingResponse:
-    summary = run_service.create_run(flow_id, request.model_copy(update={"stream": True}))
-    if not summary:
-        raise HTTPException(status_code=404, detail=ErrorPayload(code="flow_not_found", message="flow not found").model_dump())
-
-    run = run_service.get_run(summary.id)
-    if not run:
-        raise HTTPException(status_code=404, detail=ErrorPayload(code="run_not_found", message="run not found").model_dump())
-
-    return StreamingResponse(stream_run_detail(run), media_type="text/event-stream")
+    return StreamingResponse(
+        (encode_sse(event, data) for event, data in flow_runner.run_flow_stream(flow_id, request.model_copy(update={"stream": True}))),
+        media_type="text/event-stream",
+    )
 
 
 @router.get(

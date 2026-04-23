@@ -23,6 +23,7 @@ from app.schemas.contracts import (
     FlowDefinition,
     FlowEdge,
     FlowStatus,
+    FlowUpdateRequest,
     FlowVersionDetail,
     ModelConfig,
     Position,
@@ -32,6 +33,9 @@ from app.schemas.contracts import (
     RunStepResult,
     StartNode,
     StartNodeData,
+    TeamCreateRequest,
+    TeamDetail,
+    TeamUpdateRequest,
 )
 
 
@@ -233,11 +237,101 @@ class PostgresStore:
         )
         return self._insert_agent(agent)
 
+    def _row_to_team(self, row: dict[str, Any]) -> TeamDetail:
+        return TeamDetail(
+            id=row["id"],
+            name=row["name"],
+            description=row["description"],
+            owner_user_id=row["owner_user_id"],
+            workspace_id=row["workspace_id"],
+            strategy=row["strategy"],
+            member_agent_ids=as_list(row["member_agent_ids_json"]),
+            status=row["status"],
+            version=row["version"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def list_teams(self) -> list[TeamDetail]:
+        with self.connect() as conn:
+            rows = conn.execute("select * from teams order by updated_at desc").fetchall()
+        return [self._row_to_team(row) for row in rows]
+
+    def get_team(self, team_id: str) -> TeamDetail | None:
+        with self.connect() as conn:
+            row = conn.execute("select * from teams where id = %s", (team_id,)).fetchone()
+        return self._row_to_team(row) if row else None
+
+    def create_team(self, request: TeamCreateRequest) -> TeamDetail:
+        now = utcnow()
+        team = TeamDetail(
+            id=f"team_{uuid4().hex[:12]}",
+            version=1,
+            created_at=now,
+            updated_at=now,
+            **request.model_dump(),
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into teams (
+                  id, name, description, owner_user_id, workspace_id, strategy,
+                  member_agent_ids_json, status, version, created_at, updated_at
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    team.id,
+                    team.name,
+                    team.description,
+                    team.owner_user_id,
+                    team.workspace_id,
+                    team.strategy,
+                    to_json(team.member_agent_ids),
+                    team.status,
+                    team.version,
+                    team.created_at,
+                    team.updated_at,
+                ),
+            )
+        return team
+
+    def update_team(self, team_id: str, request: TeamUpdateRequest) -> TeamDetail | None:
+        team = self.get_team(team_id)
+        if not team:
+            return None
+        updated = team.model_copy(
+            update={**request.model_dump(exclude_none=True), "updated_at": utcnow(), "version": team.version + 1}
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                update teams set
+                  name=%s, description=%s, strategy=%s, member_agent_ids_json=%s,
+                  status=%s, version=%s, updated_at=%s
+                where id=%s
+                """,
+                (
+                    updated.name,
+                    updated.description,
+                    updated.strategy,
+                    to_json(updated.member_agent_ids),
+                    updated.status,
+                    updated.version,
+                    updated.updated_at,
+                    updated.id,
+                ),
+            )
+        return updated
+
     def update_agent(self, agent_id: str, request: AgentUpdateRequest) -> AgentDetail | None:
         agent = self.get_agent(agent_id)
         if not agent:
             return None
-        updated = agent.model_copy(update={**request.model_dump(exclude_none=True), "updated_at": utcnow(), "version": agent.version + 1})
+        patch = request.model_dump(exclude_none=True)
+        if isinstance(patch.get("llm_config"), dict):
+            patch["llm_config"] = ModelConfig(**patch["llm_config"])
+        updated = agent.model_copy(update={**patch, "updated_at": utcnow(), "version": agent.version + 1})
         config = {"temperature": updated.llm_config.temperature, "extra": updated.llm_config.extra}
         with self.connect() as conn:
             conn.execute(
@@ -283,6 +377,7 @@ class PostgresStore:
             id=row["id"],
             name=row["name"],
             description=row["description"],
+            flow_type=row["flow_type"] if "flow_type" in row.keys() and row["flow_type"] else "agent",
             owner_user_id=row["owner_user_id"],
             workspace_id=row["workspace_id"],
             status=row["status"],
@@ -327,6 +422,7 @@ class PostgresStore:
             updated_at=now,
             name=request.name,
             description=request.description,
+            flow_type=request.flow_type,
             owner_user_id=request.owner_user_id,
             workspace_id=request.workspace_id,
             definition=request.definition,
@@ -335,14 +431,15 @@ class PostgresStore:
         with self.connect() as conn:
             conn.execute(
                 """
-                insert into flows (id, name, description, owner_user_id, workspace_id, status, latest_version, created_at, updated_at)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                insert into flows (id, name, description, flow_type, owner_user_id, workspace_id, status, latest_version, created_at, updated_at)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 on conflict (id) do nothing
                 """,
                 (
                     flow.id,
                     flow.name,
                     flow.description,
+                    flow.flow_type.value,
                     flow.owner_user_id,
                     flow.workspace_id,
                     flow.status.value,
@@ -360,6 +457,63 @@ class PostgresStore:
                 (version_id, flow.id, 1, flow.status.value, to_json(flow.definition.model_dump(mode="json")), now),
             )
         return flow
+
+    def update_flow(self, flow_id: str, request: FlowUpdateRequest) -> FlowVersionDetail | None:
+        flow = self.get_flow(flow_id)
+        if not flow:
+            return None
+
+        now = utcnow()
+        definition = request.definition or flow.definition
+        status = request.status or flow.status
+        flow_type = request.flow_type or flow.flow_type
+        next_version = flow.latest_version + 1
+        updated = FlowVersionDetail(
+            id=flow.id,
+            name=request.name if request.name is not None else flow.name,
+            description=request.description if request.description is not None else flow.description,
+            flow_type=flow_type,
+            owner_user_id=flow.owner_user_id,
+            workspace_id=flow.workspace_id,
+            status=status,
+            latest_version=next_version,
+            created_at=flow.created_at,
+            updated_at=now,
+            definition=definition,
+        )
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                update flows set
+                  name=%s, description=%s, flow_type=%s, status=%s, latest_version=%s, updated_at=%s
+                where id=%s
+                """,
+                (
+                    updated.name,
+                    updated.description,
+                    updated.flow_type.value,
+                    updated.status.value,
+                    updated.latest_version,
+                    updated.updated_at,
+                    updated.id,
+                ),
+            )
+            conn.execute(
+                """
+                insert into flow_versions (id, flow_id, version, status, definition_json, created_at)
+                values (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    f"flow_version_{uuid4().hex[:12]}",
+                    updated.id,
+                    updated.latest_version,
+                    updated.status.value,
+                    to_json(updated.definition.model_dump(mode="json")),
+                    now,
+                ),
+            )
+        return updated
 
     def get_run(self, run_id: str) -> RunDetail | None:
         with self.connect() as conn:

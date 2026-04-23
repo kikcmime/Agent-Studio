@@ -17,7 +17,9 @@ from app.schemas.contracts import (
     FlowDefinition,
     FlowEdge,
     FlowStatus,
+    FlowUpdateRequest,
     FlowVersionDetail,
+    ModelConfig,
     Position,
     RunCreateRequest,
     RunDetail,
@@ -28,6 +30,9 @@ from app.schemas.contracts import (
     StartNode,
     StartNodeData,
     StepStatus,
+    TeamCreateRequest,
+    TeamDetail,
+    TeamUpdateRequest,
 )
 
 
@@ -38,6 +43,7 @@ def utcnow() -> datetime:
 class InMemoryStore:
     def __init__(self) -> None:
         self.agents: dict[str, AgentDetail] = {}
+        self.teams: dict[str, TeamDetail] = {}
         self.flows: dict[str, FlowVersionDetail] = {}
         self.runs: dict[str, RunDetail] = {}
         self._seed()
@@ -124,12 +130,43 @@ class InMemoryStore:
         self.agents[agent.id] = agent
         return agent
 
+    def list_teams(self) -> list[TeamDetail]:
+        return list(self.teams.values())
+
+    def get_team(self, team_id: str) -> TeamDetail | None:
+        return self.teams.get(team_id)
+
+    def create_team(self, request: TeamCreateRequest) -> TeamDetail:
+        now = utcnow()
+        team = TeamDetail(
+            id=f"team_{uuid4().hex[:12]}",
+            version=1,
+            created_at=now,
+            updated_at=now,
+            **request.model_dump(),
+        )
+        self.teams[team.id] = team
+        return team
+
+    def update_team(self, team_id: str, request: TeamUpdateRequest) -> TeamDetail | None:
+        team = self.teams.get(team_id)
+        if not team:
+            return None
+        updated = team.model_copy(
+            update={**request.model_dump(exclude_none=True), "updated_at": utcnow(), "version": team.version + 1}
+        )
+        self.teams[team_id] = updated
+        return updated
+
     def update_agent(self, agent_id: str, request: AgentUpdateRequest) -> AgentDetail | None:
         agent = self.agents.get(agent_id)
         if not agent:
             return None
+        patch = request.model_dump(exclude_none=True)
+        if isinstance(patch.get("llm_config"), dict):
+            patch["llm_config"] = ModelConfig(**patch["llm_config"])
         updated = agent.model_copy(
-            update={**request.model_dump(exclude_none=True), "updated_at": utcnow(), "version": agent.version + 1}
+            update={**patch, "updated_at": utcnow(), "version": agent.version + 1}
         )
         self.agents[agent_id] = updated
         return updated
@@ -150,12 +187,27 @@ class InMemoryStore:
             updated_at=now,
             name=request.name,
             description=request.description,
+            flow_type=request.flow_type,
             owner_user_id=request.owner_user_id,
             workspace_id=request.workspace_id,
             definition=request.definition,
         )
         self.flows[flow.id] = flow
         return flow
+
+    def update_flow(self, flow_id: str, request: FlowUpdateRequest) -> FlowVersionDetail | None:
+        flow = self.flows.get(flow_id)
+        if not flow:
+            return None
+        updated = flow.model_copy(
+            update={
+                **request.model_dump(exclude_none=True),
+                "latest_version": flow.latest_version + 1,
+                "updated_at": utcnow(),
+            }
+        )
+        self.flows[flow_id] = updated
+        return updated
 
     def get_run(self, run_id: str) -> RunDetail | None:
         return self.runs.get(run_id)

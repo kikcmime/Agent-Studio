@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -206,12 +207,7 @@ class FlowRunner:
             if isinstance(node, TeamNode):
                 started_at = utcnow()
                 resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
-                team_output = {
-                    "mode": "team_placeholder",
-                    "strategy": node.data.strategy,
-                    "member_agent_ids": node.data.member_agent_ids,
-                    "message": "Team node execution placeholder. Parallel child execution will be implemented in the orchestrator layer.",
-                }
+                team_output = self._run_team_node(node, resolved_input)
                 runtime_context["steps"][node.id] = team_output
                 steps.append(
                     RunStepResult(
@@ -229,9 +225,9 @@ class FlowRunner:
                     RunEvent(
                         id=f"event_{uuid4().hex[:10]}",
                         run_id=run_id,
-                        event_type="team.placeholder.completed",
+                        event_type="team.completed",
                         created_at=utcnow(),
-                        payload={"node_id": node.id, "member_agent_ids": node.data.member_agent_ids},
+                        payload={"node_id": node.id, "member_agent_ids": team_output.get("member_agent_ids", [])},
                     )
                 )
                 if node.data.member_agent_ids and node.data.label.lower().startswith("fail"):
@@ -297,6 +293,350 @@ class FlowRunner:
             steps=steps,
             events=events,
         )
+
+    def run_flow_stream(self, flow_id: str, request: RunCreateRequest) -> Iterator[tuple[str, dict[str, Any]]]:
+        flow = self.store.get_flow(flow_id)
+        if not flow:
+            yield "run.failed", {"error": "flow not found", "flow_id": flow_id}
+            return
+
+        definition = flow.definition
+        node_map = {node.id: node for node in definition.nodes}
+        edges_by_source = self._build_edges_by_source(definition.edges)
+        current = self._resolve_start_node(definition)
+        run_id = f"run_{uuid4().hex[:12]}"
+        started_at = utcnow()
+        steps: list[RunStepResult] = []
+        events: list[RunEvent] = [
+            RunEvent(
+                id=f"event_{uuid4().hex[:10]}",
+                run_id=run_id,
+                event_type="run.started",
+                created_at=started_at,
+                payload={"flow_id": flow_id, "flow_version": flow.latest_version},
+            )
+        ]
+        runtime_context: dict = {"input": request.input, "steps": {}, "retry_counts": {}}
+
+        yield "run.started", {"run_id": run_id, "flow_id": flow_id, "status": "running"}
+
+        if current is None:
+            failed = self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, started_at, utcnow(), steps, events)
+            self._save_stream_run(failed)
+            yield "run.completed", failed.model_dump(mode="json")
+            return
+
+        step_guard = 0
+        while current is not None:
+            step_guard += 1
+            if step_guard > 200:
+                failed = self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, started_at, utcnow(), steps, events)
+                self._save_stream_run(failed)
+                yield "run.completed", failed.model_dump(mode="json")
+                return
+
+            node = current
+            if isinstance(node, StartNode):
+                current = self._select_next_node(node.id, edges_by_source, node_map)
+                continue
+
+            if isinstance(node, EndNode):
+                finished_at = utcnow()
+                events.append(
+                    RunEvent(
+                        id=f"event_{uuid4().hex[:10]}",
+                        run_id=run_id,
+                        event_type="run.finished",
+                        created_at=finished_at,
+                        payload={"end_node_id": node.id},
+                    )
+                )
+                output = self._build_final_output(runtime_context, steps)
+                detail = RunDetail(
+                    id=run_id,
+                    flow_id=flow_id,
+                    flow_version=flow.latest_version,
+                    status=RunStatus.COMPLETED,
+                    input=request.input,
+                    output=output,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    steps=steps,
+                    events=events,
+                )
+                self._save_stream_run(detail)
+                yield "run.completed", detail.model_dump(mode="json")
+                return
+
+            if isinstance(node, AgentNode):
+                agent = self.store.get_agent(node.data.agent_binding.agent_id)
+                resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
+                step_started_at = utcnow()
+                yield "step.started", {"run_id": run_id, "node_id": node.id, "agent_id": node.data.agent_binding.agent_id}
+
+                if not agent:
+                    failed_at = utcnow()
+                    error = f"agent {node.data.agent_binding.agent_id} not found"
+                    steps.append(
+                        RunStepResult(
+                            id=f"step_{uuid4().hex[:10]}",
+                            node_id=node.id,
+                            node_type=node.type,
+                            status=StepStatus.FAILED,
+                            started_at=step_started_at,
+                            finished_at=failed_at,
+                            input=resolved_input,
+                            output={},
+                            error=error,
+                        )
+                    )
+                    yield "step.failed", {"run_id": run_id, "node_id": node.id, "error": error}
+                    failed = self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, started_at, failed_at, steps, events)
+                    self._save_stream_run(failed)
+                    yield "run.completed", failed.model_dump(mode="json")
+                    return
+
+                output: dict[str, Any] | None = None
+                try:
+                    for item in agent_runner.stream(agent, resolved_input):
+                        if item.get("type") == "delta":
+                            yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": item.get("delta", "")}
+                        elif item.get("type") == "completed":
+                            output = item.get("output") or {}
+                except Exception as exc:
+                    failed_at = utcnow()
+                    steps.append(
+                        RunStepResult(
+                            id=f"step_{uuid4().hex[:10]}",
+                            node_id=node.id,
+                            node_type=node.type,
+                            status=StepStatus.FAILED,
+                            started_at=step_started_at,
+                            finished_at=failed_at,
+                            input=resolved_input,
+                            output={},
+                            error=str(exc),
+                        )
+                    )
+                    yield "step.failed", {"run_id": run_id, "node_id": node.id, "error": str(exc)}
+                    failed = self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, started_at, failed_at, steps, events)
+                    self._save_stream_run(failed)
+                    yield "run.completed", failed.model_dump(mode="json")
+                    return
+
+                output = output or {"message": ""}
+                finished_at = utcnow()
+                runtime_context["steps"][node.id] = output
+                steps.append(
+                    RunStepResult(
+                        id=f"step_{uuid4().hex[:10]}",
+                        node_id=node.id,
+                        node_type=node.type,
+                        status=StepStatus.COMPLETED,
+                        started_at=step_started_at,
+                        finished_at=finished_at,
+                        input=resolved_input,
+                        output={"result": output, "mapped_output": node.data.output_mapping or {node.id: "{{output}}"}},
+                    )
+                )
+                yield "step.completed", {"run_id": run_id, "node_id": node.id, "output": output}
+                current = self._select_next_node(node.id, edges_by_source, node_map)
+                continue
+
+            if isinstance(node, TeamNode):
+                step_started_at = utcnow()
+                resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
+                team_output = self._empty_team_output(node)
+                member_agent_ids = team_output["member_agent_ids"]
+                member_results: list[dict[str, Any]] = []
+
+                for index, member_agent_id in enumerate(member_agent_ids):
+                    agent = self.store.get_agent(member_agent_id)
+                    if not agent:
+                        member_results.append(
+                            {
+                                "agent_id": member_agent_id,
+                                "agent_name": member_agent_id,
+                                "status": "failed",
+                                "message": f"Agent {member_agent_id} not found.",
+                            }
+                        )
+                        continue
+
+                    yield "team.member.started", {
+                        "run_id": run_id,
+                        "node_id": node.id,
+                        "agent_id": member_agent_id,
+                        "agent_name": agent.name,
+                    }
+
+                    if len(member_agent_ids) > 1:
+                        prefix = f"{agent.name}:\n"
+                        if index > 0:
+                            prefix = f"\n\n{prefix}"
+                        yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": prefix}
+
+                    member_output: dict[str, Any] | None = None
+                    try:
+                        for item in agent_runner.stream(agent, resolved_input):
+                            if item.get("type") == "delta":
+                                yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": item.get("delta", "")}
+                            elif item.get("type") == "completed":
+                                member_output = item.get("output") or {}
+                    except Exception as exc:
+                        member_output = {
+                            "agent_id": member_agent_id,
+                            "agent_name": agent.name,
+                            "message": f"执行失败：{exc}",
+                            "error": str(exc),
+                        }
+
+                    member_output = member_output or {
+                        "agent_id": member_agent_id,
+                        "agent_name": agent.name,
+                        "message": "",
+                    }
+                    member_results.append(
+                        {
+                            "agent_id": member_agent_id,
+                            "agent_name": agent.name,
+                            "status": "failed" if member_output.get("error") else "completed",
+                            "output": member_output,
+                            "message": member_output.get("message", ""),
+                        }
+                    )
+                    yield "team.member.completed", {
+                        "run_id": run_id,
+                        "node_id": node.id,
+                        "agent_id": member_agent_id,
+                        "status": member_results[-1]["status"],
+                    }
+
+                team_output = self._build_team_output(node, member_results)
+                step_finished_at = utcnow()
+                runtime_context["steps"][node.id] = team_output
+                steps.append(
+                    RunStepResult(
+                        id=f"step_{uuid4().hex[:10]}",
+                        node_id=node.id,
+                        node_type=node.type,
+                        status=StepStatus.COMPLETED,
+                        started_at=step_started_at,
+                        finished_at=step_finished_at,
+                        input=resolved_input,
+                        output={"result": team_output},
+                    )
+                )
+                yield "team.completed", {"run_id": run_id, "node_id": node.id, "output": team_output}
+                current = self._select_next_node(node.id, edges_by_source, node_map)
+                continue
+
+            current = self._select_next_node(node.id, edges_by_source, node_map)
+
+        output = self._build_final_output(runtime_context, steps)
+        detail = RunDetail(
+            id=run_id,
+            flow_id=flow_id,
+            flow_version=flow.latest_version,
+            status=RunStatus.COMPLETED,
+            input=request.input,
+            output=output,
+            started_at=started_at,
+            finished_at=utcnow(),
+            steps=steps,
+            events=events,
+        )
+        self._save_stream_run(detail)
+        yield "run.completed", detail.model_dump(mode="json")
+
+    def _save_stream_run(self, detail: RunDetail) -> None:
+        if hasattr(self.store, "save_run"):
+            self.store.save_run(detail)
+        else:
+            self.store.runs[detail.id] = detail
+
+    def _resolve_team_member_ids(self, node: TeamNode) -> list[str]:
+        if node.data.member_agent_ids:
+            return node.data.member_agent_ids
+
+        if node.data.team_id and hasattr(self.store, "get_team"):
+            team = self.store.get_team(node.data.team_id)
+            if team:
+                return team.member_agent_ids
+
+        return []
+
+    def _empty_team_output(self, node: TeamNode) -> dict[str, Any]:
+        return {
+            "mode": "team",
+            "strategy": node.data.strategy,
+            "team_id": node.data.team_id,
+            "member_agent_ids": self._resolve_team_member_ids(node),
+            "member_results": [],
+            "message": "",
+        }
+
+    def _build_team_output(self, node: TeamNode, member_results: list[dict[str, Any]]) -> dict[str, Any]:
+        messages: list[str] = []
+        for result in member_results:
+            agent_name = result.get("agent_name") or result.get("agent_id") or "Agent"
+            message = result.get("message") or ""
+            if message:
+                messages.append(f"{agent_name}: {message}")
+
+        if not messages and member_results:
+            messages.append("Team 已执行完成，但成员 Agent 没有返回文本结果。")
+        if not member_results:
+            messages.append("Team 没有绑定可执行的成员 Agent。")
+
+        return {
+            "mode": "team",
+            "strategy": node.data.strategy,
+            "team_id": node.data.team_id,
+            "member_agent_ids": self._resolve_team_member_ids(node),
+            "member_results": member_results,
+            "message": "\n\n".join(messages),
+        }
+
+    def _run_team_node(self, node: TeamNode, resolved_input: dict[str, Any]) -> dict[str, Any]:
+        member_results: list[dict[str, Any]] = []
+
+        for member_agent_id in self._resolve_team_member_ids(node):
+            agent = self.store.get_agent(member_agent_id)
+            if not agent:
+                member_results.append(
+                    {
+                        "agent_id": member_agent_id,
+                        "agent_name": member_agent_id,
+                        "status": "failed",
+                        "message": f"Agent {member_agent_id} not found.",
+                    }
+                )
+                continue
+
+            try:
+                output = agent_runner.run(agent, resolved_input)
+                member_results.append(
+                    {
+                        "agent_id": member_agent_id,
+                        "agent_name": agent.name,
+                        "status": "completed",
+                        "output": output,
+                        "message": output.get("message", ""),
+                    }
+                )
+            except Exception as exc:
+                member_results.append(
+                    {
+                        "agent_id": member_agent_id,
+                        "agent_name": agent.name,
+                        "status": "failed",
+                        "message": f"执行失败：{exc}",
+                        "error": str(exc),
+                    }
+                )
+
+        return self._build_team_output(node, member_results)
 
     def _build_edges_by_source(self, edges: list[FlowEdge]) -> dict[str, list[FlowEdge]]:
         edges_by_source: dict[str, list[FlowEdge]] = defaultdict(list)
@@ -419,6 +759,10 @@ class FlowRunner:
                 resolved[key] = current
             else:
                 resolved[key] = value
+        source_input = runtime_context.get("input", {})
+        for passthrough_key in ("messages", "session_id"):
+            if passthrough_key in source_input and passthrough_key not in resolved:
+                resolved[passthrough_key] = source_input[passthrough_key]
         return resolved
 
     def _resolve_context_value(self, expression: str, runtime_context: dict):
