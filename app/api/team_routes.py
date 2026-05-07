@@ -57,3 +57,15 @@ def update_team(team_id: str, request: TeamUpdateRequest) -> SuccessResponse[Tea
     if not team:
         raise HTTPException(status_code=404, detail=ErrorPayload(code="team_not_found", message="team not found").model_dump())
     return SuccessResponse(data=team)
+
+
+@router.delete(
+    "/teams/{team_id}",
+    response_model=SuccessResponse[TeamDetail],
+    responses={404: {"model": ErrorResponse}},
+)
+def delete_team(team_id: str) -> SuccessResponse[TeamDetail]:
+    team = team_service.delete_team(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail=ErrorPayload(code="team_not_found", message="team not found").model_dump())
+    return SuccessResponse(data=team)

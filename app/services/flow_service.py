@@ -13,11 +13,19 @@ class FlowService:
 
     def create_flow(self, request: FlowCreateRequest) -> FlowVersionDetail:
         store = get_store()
+        if request.is_primary:
+            request.is_exposed = True
         return store.create_flow(request)
 
     def update_flow(self, flow_id: str, request: FlowUpdateRequest) -> FlowVersionDetail | None:
         store = get_store()
+        if request.is_primary:
+            request.is_exposed = True
         return store.update_flow(flow_id, request)
+
+    def delete_flow(self, flow_id: str) -> FlowVersionDetail | None:
+        store = get_store()
+        return store.delete_flow(flow_id)
 
 
 flow_service = FlowService()

@@ -325,6 +325,8 @@ class FlowSummary(BaseModel):
     owner_user_id: str | None = None
     workspace_id: str | None = None
     status: FlowStatus = FlowStatus.DRAFT
+    is_exposed: bool = False
+    is_primary: bool = False
     latest_version: int = 1
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -336,6 +338,8 @@ class FlowCreateRequest(BaseModel):
     flow_type: FlowType = FlowType.AGENT
     owner_user_id: str | None = None
     workspace_id: str | None = None
+    is_exposed: bool = False
+    is_primary: bool = False
     definition: FlowDefinition
 
 
@@ -345,6 +349,8 @@ class FlowUpdateRequest(BaseModel):
     flow_type: FlowType | None = None
     definition: FlowDefinition | None = None
     status: FlowStatus | None = None
+    is_exposed: bool | None = None
+    is_primary: bool | None = None
 
 
 class FlowVersionDetail(FlowSummary):

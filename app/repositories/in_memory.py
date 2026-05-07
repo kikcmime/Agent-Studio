@@ -104,6 +104,8 @@ class InMemoryStore:
             description="Seed response for frontend integration",
             owner_user_id="demo_user",
             status=FlowStatus.DRAFT,
+            is_exposed=True,
+            is_primary=True,
             latest_version=1,
             definition=definition,
             created_at=utcnow(),
@@ -128,6 +130,23 @@ class InMemoryStore:
             **request.model_dump(),
         )
         self.agents[agent.id] = agent
+        return agent
+
+    def delete_agent(self, agent_id: str) -> AgentDetail | None:
+        agent = self.agents.pop(agent_id, None)
+        if not agent:
+            return None
+        for team_id, team in list(self.teams.items()):
+            if agent_id not in team.member_agent_ids:
+                continue
+            updated = team.model_copy(
+                update={
+                    "member_agent_ids": [member_id for member_id in team.member_agent_ids if member_id != agent_id],
+                    "updated_at": utcnow(),
+                    "version": team.version + 1,
+                }
+            )
+            self.teams[team_id] = updated
         return agent
 
     def list_teams(self) -> list[TeamDetail]:
@@ -158,6 +177,9 @@ class InMemoryStore:
         self.teams[team_id] = updated
         return updated
 
+    def delete_team(self, team_id: str) -> TeamDetail | None:
+        return self.teams.pop(team_id, None)
+
     def update_agent(self, agent_id: str, request: AgentUpdateRequest) -> AgentDetail | None:
         agent = self.agents.get(agent_id)
         if not agent:
@@ -182,6 +204,8 @@ class InMemoryStore:
         flow = FlowVersionDetail(
             id=f"flow_{uuid4().hex[:12]}",
             status=FlowStatus.DRAFT,
+            is_exposed=request.is_exposed,
+            is_primary=request.is_primary,
             latest_version=1,
             created_at=now,
             updated_at=now,
@@ -208,6 +232,15 @@ class InMemoryStore:
         )
         self.flows[flow_id] = updated
         return updated
+
+    def delete_flow(self, flow_id: str) -> FlowVersionDetail | None:
+        flow = self.flows.pop(flow_id, None)
+        if not flow:
+            return None
+        for run_id, run in list(self.runs.items()):
+            if run.flow_id == flow_id:
+                self.runs.pop(run_id, None)
+        return flow
 
     def get_run(self, run_id: str) -> RunDetail | None:
         return self.runs.get(run_id)

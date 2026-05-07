@@ -58,6 +58,18 @@ def get_flow(flow_id: str) -> SuccessResponse[FlowVersionDetail]:
     return SuccessResponse(data=flow)
 
 
+@router.delete(
+    "/flows/{flow_id}",
+    response_model=SuccessResponse[FlowVersionDetail],
+    responses={404: {"model": ErrorResponse}},
+)
+def delete_flow(flow_id: str) -> SuccessResponse[FlowVersionDetail]:
+    flow = flow_service.delete_flow(flow_id)
+    if not flow:
+        raise HTTPException(status_code=404, detail=ErrorPayload(code="flow_not_found", message="flow not found").model_dump())
+    return SuccessResponse(data=flow)
+
+
 @router.get(
     "/flows/{flow_id}/versions/latest",
     response_model=SuccessResponse[FlowDefinition],

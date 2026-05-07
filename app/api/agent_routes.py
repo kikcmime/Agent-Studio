@@ -69,6 +69,18 @@ def update_agent(agent_id: str, request: AgentUpdateRequest) -> SuccessResponse[
     return SuccessResponse(data=agent)
 
 
+@router.delete(
+    "/agents/{agent_id}",
+    response_model=SuccessResponse[AgentDetail],
+    responses={404: {"model": ErrorResponse}},
+)
+def delete_agent(agent_id: str) -> SuccessResponse[AgentDetail]:
+    agent = agent_service.delete_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail=ErrorPayload(code="agent_not_found", message="agent not found").model_dump())
+    return SuccessResponse(data=agent)
+
+
 @router.post(
     "/agents/{agent_id}/runs/stream",
     responses={404: {"model": ErrorResponse}},

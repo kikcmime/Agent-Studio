@@ -72,6 +72,8 @@ class PostgresStore:
         schema_path = Path(__file__).resolve().parents[2] / "db" / "schema.sql"
         with self.connect() as conn:
             conn.execute(schema_path.read_text())
+            conn.execute("alter table flows add column if not exists is_exposed boolean not null default false")
+            conn.execute("alter table flows add column if not exists is_primary boolean not null default false")
 
     def seed_if_empty(self) -> None:
         with self.connect() as conn:
@@ -126,6 +128,8 @@ class PostgresStore:
                 name="Demo Flow",
                 description="Seed response for frontend integration",
                 owner_user_id="demo_user",
+                is_exposed=True,
+                is_primary=True,
                 definition=definition,
             ),
             flow_id="flow_demo",
@@ -237,6 +241,39 @@ class PostgresStore:
         )
         return self._insert_agent(agent)
 
+    def delete_agent(self, agent_id: str) -> AgentDetail | None:
+        agent = self.get_agent(agent_id)
+        if not agent:
+            return None
+
+        with self.connect() as conn:
+            conn.execute("delete from agent_skills where agent_id = %s", (agent_id,))
+            conn.execute("delete from agent_resources where agent_id = %s", (agent_id,))
+
+            team_rows = conn.execute("select * from teams").fetchall()
+            for row in team_rows:
+                member_agent_ids = as_list(row["member_agent_ids_json"])
+                if agent_id not in member_agent_ids:
+                    continue
+                updated_member_agent_ids = [member_id for member_id in member_agent_ids if member_id != agent_id]
+                conn.execute(
+                    """
+                    update teams set
+                      member_agent_ids_json=%s, version=%s, updated_at=%s
+                    where id=%s
+                    """,
+                    (
+                        to_json(updated_member_agent_ids),
+                        row["version"] + 1,
+                        utcnow(),
+                        row["id"],
+                    ),
+                )
+
+            conn.execute("delete from agents where id = %s", (agent_id,))
+
+        return agent
+
     def _row_to_team(self, row: dict[str, Any]) -> TeamDetail:
         return TeamDetail(
             id=row["id"],
@@ -324,6 +361,14 @@ class PostgresStore:
             )
         return updated
 
+    def delete_team(self, team_id: str) -> TeamDetail | None:
+        team = self.get_team(team_id)
+        if not team:
+            return None
+        with self.connect() as conn:
+            conn.execute("delete from teams where id = %s", (team_id,))
+        return team
+
     def update_agent(self, agent_id: str, request: AgentUpdateRequest) -> AgentDetail | None:
         agent = self.get_agent(agent_id)
         if not agent:
@@ -381,6 +426,8 @@ class PostgresStore:
             owner_user_id=row["owner_user_id"],
             workspace_id=row["workspace_id"],
             status=row["status"],
+            is_exposed=bool(row.get("is_exposed", False)),
+            is_primary=bool(row.get("is_primary", False)),
             latest_version=row["latest_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -417,6 +464,8 @@ class PostgresStore:
         flow = FlowVersionDetail(
             id=flow_id or f"flow_{uuid4().hex[:12]}",
             status=FlowStatus.DRAFT,
+            is_exposed=request.is_exposed,
+            is_primary=request.is_primary,
             latest_version=1,
             created_at=now,
             updated_at=now,
@@ -431,8 +480,8 @@ class PostgresStore:
         with self.connect() as conn:
             conn.execute(
                 """
-                insert into flows (id, name, description, flow_type, owner_user_id, workspace_id, status, latest_version, created_at, updated_at)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                insert into flows (id, name, description, flow_type, owner_user_id, workspace_id, status, is_exposed, is_primary, latest_version, created_at, updated_at)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 on conflict (id) do nothing
                 """,
                 (
@@ -443,6 +492,8 @@ class PostgresStore:
                     flow.owner_user_id,
                     flow.workspace_id,
                     flow.status.value,
+                    flow.is_exposed,
+                    flow.is_primary,
                     flow.latest_version,
                     flow.created_at,
                     flow.updated_at,
@@ -476,6 +527,8 @@ class PostgresStore:
             owner_user_id=flow.owner_user_id,
             workspace_id=flow.workspace_id,
             status=status,
+            is_exposed=request.is_exposed if request.is_exposed is not None else flow.is_exposed,
+            is_primary=request.is_primary if request.is_primary is not None else flow.is_primary,
             latest_version=next_version,
             created_at=flow.created_at,
             updated_at=now,
@@ -486,7 +539,7 @@ class PostgresStore:
             conn.execute(
                 """
                 update flows set
-                  name=%s, description=%s, flow_type=%s, status=%s, latest_version=%s, updated_at=%s
+                  name=%s, description=%s, flow_type=%s, status=%s, is_exposed=%s, is_primary=%s, latest_version=%s, updated_at=%s
                 where id=%s
                 """,
                 (
@@ -494,6 +547,8 @@ class PostgresStore:
                     updated.description,
                     updated.flow_type.value,
                     updated.status.value,
+                    updated.is_exposed,
+                    updated.is_primary,
                     updated.latest_version,
                     updated.updated_at,
                     updated.id,
@@ -514,6 +569,23 @@ class PostgresStore:
                 ),
             )
         return updated
+
+    def delete_flow(self, flow_id: str) -> FlowVersionDetail | None:
+        flow = self.get_flow(flow_id)
+        if not flow:
+            return None
+
+        with self.connect() as conn:
+            run_rows = conn.execute("select id from runs where flow_id = %s", (flow_id,)).fetchall()
+            run_ids = [row["id"] for row in run_rows]
+            for run_id in run_ids:
+                conn.execute("delete from run_events where run_id = %s", (run_id,))
+                conn.execute("delete from run_steps where run_id = %s", (run_id,))
+            conn.execute("delete from runs where flow_id = %s", (flow_id,))
+            conn.execute("delete from flow_versions where flow_id = %s", (flow_id,))
+            conn.execute("delete from flows where id = %s", (flow_id,))
+
+        return flow
 
     def get_run(self, run_id: str) -> RunDetail | None:
         with self.connect() as conn:

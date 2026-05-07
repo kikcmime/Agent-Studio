@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterator
 from datetime import datetime
+import re
 from typing import Any
 from uuid import uuid4
 
+from app.core.llm import invoke_text_classification
 from app.repositories.factory import get_store
 from app.runners.agent_runner import agent_runner
 from app.schemas.contracts import (
@@ -46,7 +48,7 @@ class FlowRunner:
             return None
 
         steps: list[RunStepResult] = []
-        runtime_context: dict = {"input": request.input, "steps": {}, "retry_counts": {}}
+        runtime_context: dict = {"input": request.input, "steps": {}, "retry_counts": {}, "flow_id": flow_id}
         now = utcnow()
         run_id = f"run_{uuid4().hex[:12]}"
         events: list[RunEvent] = [
@@ -94,7 +96,7 @@ class FlowRunner:
                             started_at=now,
                             finished_at=failed_at,
                             input={},
-                            output={},
+                            output=self._build_failed_output(request_input, steps),
                             error=f"agent {node.data.agent_binding.agent_id} not found",
                         )
                     )
@@ -119,6 +121,7 @@ class FlowRunner:
                     return self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, now, failed_at, steps, events)
 
                 resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
+                resolved_input = self._inject_round_context(node.id, resolved_input, runtime_context)
                 started_at = utcnow()
                 events.append(
                     RunEvent(
@@ -142,7 +145,7 @@ class FlowRunner:
                             started_at=started_at,
                             finished_at=failed_at,
                             input=resolved_input,
-                            output={},
+                            output=self._build_failed_output(request_input, steps),
                             error=str(exc),
                         )
                     )
@@ -180,6 +183,40 @@ class FlowRunner:
                 finished_at = utcnow()
                 output_key = node.data.output_mapping or {node.id: "{{output}}"}
                 runtime_context["steps"][node.id] = output
+                if self._output_requests_retry(output):
+                    retry_target = self._resolve_retry_target(node.id, node.data.max_retry, node.data.on_fail, runtime_context)
+                    if retry_target and retry_target in node_map:
+                        steps.append(
+                            RunStepResult(
+                                id=f"step_{uuid4().hex[:10]}",
+                                node_id=node.id,
+                                node_type=node.type,
+                                status=StepStatus.FAILED,
+                                started_at=started_at,
+                                finished_at=finished_at,
+                                input=resolved_input,
+                                output={"result": output, "mapped_output": output_key},
+                                error="agent requested retry",
+                            )
+                        )
+                        events.append(
+                            RunEvent(
+                                id=f"event_{uuid4().hex[:10]}",
+                                run_id=run_id,
+                                event_type="retry.redirected",
+                                created_at=utcnow(),
+                                payload={
+                                    "failed_node_id": node.id,
+                                    "target_node_id": retry_target,
+                                    "retry_count": runtime_context["retry_counts"][node.id],
+                                    "max_retry": node.data.max_retry,
+                                },
+                            )
+                        )
+                        current = node_map.get(retry_target)
+                        continue
+
+                    return self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, now, finished_at, steps, events)
                 steps.append(
                     RunStepResult(
                         id=f"step_{uuid4().hex[:10]}",
@@ -207,7 +244,8 @@ class FlowRunner:
             if isinstance(node, TeamNode):
                 started_at = utcnow()
                 resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
-                team_output = self._run_team_node(node, resolved_input)
+                resolved_input = self._inject_round_context(node.id, resolved_input, runtime_context)
+                team_output = self._run_team_node(node, resolved_input, runtime_context)
                 runtime_context["steps"][node.id] = team_output
                 steps.append(
                     RunStepResult(
@@ -316,7 +354,7 @@ class FlowRunner:
                 payload={"flow_id": flow_id, "flow_version": flow.latest_version},
             )
         ]
-        runtime_context: dict = {"input": request.input, "steps": {}, "retry_counts": {}}
+        runtime_context: dict = {"input": request.input, "steps": {}, "retry_counts": {}, "flow_id": flow_id}
 
         yield "run.started", {"run_id": run_id, "flow_id": flow_id, "status": "running"}
 
@@ -371,6 +409,7 @@ class FlowRunner:
             if isinstance(node, AgentNode):
                 agent = self.store.get_agent(node.data.agent_binding.agent_id)
                 resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
+                resolved_input = self._inject_round_context(node.id, resolved_input, runtime_context)
                 step_started_at = utcnow()
                 yield "step.started", {"run_id": run_id, "node_id": node.id, "agent_id": node.data.agent_binding.agent_id}
 
@@ -427,6 +466,37 @@ class FlowRunner:
                 output = output or {"message": ""}
                 finished_at = utcnow()
                 runtime_context["steps"][node.id] = output
+                if self._output_requests_retry(output):
+                    retry_target = self._resolve_retry_target(node.id, node.data.max_retry, node.data.on_fail, runtime_context)
+                    if retry_target and retry_target in node_map:
+                        steps.append(
+                            RunStepResult(
+                                id=f"step_{uuid4().hex[:10]}",
+                                node_id=node.id,
+                                node_type=node.type,
+                                status=StepStatus.FAILED,
+                                started_at=step_started_at,
+                                finished_at=finished_at,
+                                input=resolved_input,
+                                output={"result": output, "mapped_output": node.data.output_mapping or {node.id: "{{output}}"}},
+                                error="agent requested retry",
+                            )
+                        )
+                        yield "step.failed", {"run_id": run_id, "node_id": node.id, "error": "agent requested retry", "output": output}
+                        yield "retry.redirected", {
+                            "run_id": run_id,
+                            "failed_node_id": node.id,
+                            "target_node_id": retry_target,
+                            "retry_count": runtime_context["retry_counts"][node.id],
+                            "max_retry": node.data.max_retry,
+                        }
+                        current = node_map.get(retry_target)
+                        continue
+
+                    failed = self._build_failed_run(run_id, flow_id, flow.latest_version, request.input, started_at, finished_at, steps, events)
+                    self._save_stream_run(failed)
+                    yield "run.completed", failed.model_dump(mode="json")
+                    return
                 steps.append(
                     RunStepResult(
                         id=f"step_{uuid4().hex[:10]}",
@@ -446,6 +516,7 @@ class FlowRunner:
             if isinstance(node, TeamNode):
                 step_started_at = utcnow()
                 resolved_input = self._resolve_input_mapping(node.data.input_mapping, runtime_context)
+                resolved_input = self._inject_round_context(node.id, resolved_input, runtime_context)
                 team_output = self._empty_team_output(node)
                 member_agent_ids = team_output["member_agent_ids"]
                 member_results: list[dict[str, Any]] = []
@@ -477,8 +548,9 @@ class FlowRunner:
                         yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": prefix}
 
                     member_output: dict[str, Any] | None = None
+                    member_input = self._inject_team_member_context(node.id, agent.name, resolved_input, runtime_context)
                     try:
-                        for item in agent_runner.stream(agent, resolved_input):
+                        for item in agent_runner.stream(agent, member_input):
                             if item.get("type") == "delta":
                                 yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": item.get("delta", "")}
                             elif item.get("type") == "completed":
@@ -529,6 +601,13 @@ class FlowRunner:
                 )
                 yield "team.completed", {"run_id": run_id, "node_id": node.id, "output": team_output}
                 current = self._select_next_node(node.id, edges_by_source, node_map)
+                continue
+
+            if isinstance(node, ConditionNode):
+                result = self._evaluate_condition(node, runtime_context)
+                runtime_context["steps"][node.id] = {"condition_result": result}
+                yield "condition.evaluated", {"run_id": run_id, "node_id": node.id, "result": result}
+                current = self._select_next_node(node.id, edges_by_source, node_map, branch=result)
                 continue
 
             current = self._select_next_node(node.id, edges_by_source, node_map)
@@ -598,7 +677,7 @@ class FlowRunner:
             "message": "\n\n".join(messages),
         }
 
-    def _run_team_node(self, node: TeamNode, resolved_input: dict[str, Any]) -> dict[str, Any]:
+    def _run_team_node(self, node: TeamNode, resolved_input: dict[str, Any], runtime_context: dict) -> dict[str, Any]:
         member_results: list[dict[str, Any]] = []
 
         for member_agent_id in self._resolve_team_member_ids(node):
@@ -615,7 +694,8 @@ class FlowRunner:
                 continue
 
             try:
-                output = agent_runner.run(agent, resolved_input)
+                member_input = self._inject_team_member_context(node.id, agent.name, resolved_input, runtime_context)
+                output = agent_runner.run(agent, member_input)
                 member_results.append(
                     {
                         "agent_id": member_agent_id,
@@ -663,6 +743,84 @@ class FlowRunner:
         retry_counts[node_id] = current_count + 1
         return on_fail
 
+    def _output_requests_retry(self, output: dict[str, Any]) -> bool:
+        status = str(output.get("status") or output.get("flow_status") or "").strip().lower()
+        if status in {"fail", "failed", "retry"}:
+            return True
+
+        message = str(output.get("message") or output.get("final_text") or "").lower()
+        retry_markers = ("flow_status: fail", "flow_status：fail", "flow_status=fail")
+        return any(marker in message for marker in retry_markers)
+
+    def _current_round(self, runtime_context: dict) -> int:
+        retry_counts = runtime_context.get("retry_counts") or {}
+        numeric_counts = [int(value or 0) for value in retry_counts.values()]
+        return max([0, *numeric_counts]) + 1
+
+    def _inject_round_context(self, node_id: str, resolved_input: dict, runtime_context: dict) -> dict:
+        if runtime_context.get("flow_id") != "flow_rps_team":
+            return resolved_input
+
+        enriched = dict(resolved_input)
+        current_round = self._current_round(runtime_context)
+        round_label = f"第{current_round}轮"
+        enriched.setdefault("current_round", current_round)
+        enriched.setdefault("round_label", round_label)
+
+        user_message = str(enriched.get("user_message") or "").strip()
+        if node_id == "rps_host":
+            enriched["user_message"] = f"{user_message}\n当前轮次：{round_label}。请只输出：{round_label}开始。".strip()
+        elif user_message and round_label not in user_message:
+            enriched["user_message"] = f"{user_message}\n当前轮次：{round_label}。"
+        return enriched
+
+    def _inject_team_member_context(self, node_id: str, agent_name: str, resolved_input: dict, runtime_context: dict) -> dict:
+        if runtime_context.get("flow_id") != "flow_rps_team" or node_id != "rps_players":
+            return resolved_input
+
+        enriched = dict(resolved_input)
+        current_round = self._current_round(runtime_context)
+        round_label = f"第{current_round}轮"
+        base_message = str(enriched.get("user_message") or "").strip()
+        if current_round > 1:
+            extra = f"当前轮次：{round_label}。\n你是{agent_name}。\n这是平局重开轮次，请只输出一个选择，并尽量避免与其他玩家完全一样。"
+        else:
+            extra = f"当前轮次：{round_label}。\n你是{agent_name}。请只输出一个选择。"
+        enriched["user_message"] = f"{base_message}\n{extra}".strip()
+        enriched["current_round"] = current_round
+        enriched["round_label"] = round_label
+        return enriched
+
+    def _build_failed_output(self, request_input: dict, steps: list[RunStepResult]) -> dict[str, Any]:
+        rounds = self._build_round_summary(steps)
+        if rounds:
+            final_round = rounds[-1]
+            summary = f"共进行了 {len(rounds)} 轮；仍未分出胜负，已达到最大重试次数。最后一轮结果：{final_round.get('result') or '未判定'}。"
+            return {
+                "final_text": f"{summary}\n\n{self._format_round_table(rounds)}",
+                "summary": summary,
+                "rounds": rounds,
+                "steps_count": len(steps),
+                "step_outputs": {step.node_id: step.output for step in steps},
+                "failed": True,
+            }
+
+        last_message = ""
+        if steps:
+            last_step = steps[-1]
+            if isinstance(last_step.output, dict):
+                last_result = last_step.output.get("result") or {}
+                if isinstance(last_result, dict):
+                    last_message = str(last_result.get("message") or "")
+        summary = last_message or "执行失败，已达到最大重试次数。"
+        return {
+            "final_text": summary,
+            "summary": summary,
+            "steps_count": len(steps),
+            "step_outputs": {step.node_id: step.output for step in steps},
+            "failed": True,
+        }
+
     def _build_failed_run(
         self,
         run_id: str,
@@ -695,6 +853,78 @@ class FlowRunner:
             steps=steps,
             events=events,
         )
+
+    def _extract_rps_choice(self, value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        match = re.search(r"(剪刀|石头|布)", value)
+        return match.group(1) if match else ""
+
+    def _extract_rps_result(self, value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        match = re.search(r"结果\s*[=:：]\s*([^\n]+)", value)
+        if match:
+            return match.group(1).strip()
+        if "平局" in value:
+            return "平局"
+        return ""
+
+    def _extract_flow_status(self, value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        match = re.search(r"flow_status\s*[:=：]\s*(success|fail|failed|retry)", value, flags=re.IGNORECASE)
+        return match.group(1).lower() if match else ""
+
+    def _build_round_summary(self, steps: list[RunStepResult]) -> list[dict[str, Any]]:
+        rounds: list[dict[str, Any]] = []
+
+        for step in steps:
+            result = step.output.get("result", {}) if isinstance(step.output, dict) else {}
+            if step.node_type == "team" and isinstance(result, dict) and result.get("mode") == "team":
+                row = {
+                    "round": len(rounds) + 1,
+                    "A": "",
+                    "B": "",
+                    "C": "",
+                    "result": "",
+                    "status": "",
+                }
+                for member in result.get("member_results", []):
+                    if not isinstance(member, dict):
+                        continue
+                    agent_name = str(member.get("agent_name") or "")
+                    message = member.get("message") or member.get("output", {}).get("message") or ""
+                    choice = self._extract_rps_choice(message)
+                    if "玩家 A" in agent_name or "玩家A" in agent_name:
+                        row["A"] = choice
+                    elif "玩家 B" in agent_name or "玩家B" in agent_name:
+                        row["B"] = choice
+                    elif "玩家 C" in agent_name or "玩家C" in agent_name:
+                        row["C"] = choice
+                rounds.append(row)
+                continue
+
+            if not rounds or step.node_type != "agent" or not isinstance(result, dict):
+                continue
+
+            message = result.get("message", "")
+            parsed_result = self._extract_rps_result(message)
+            parsed_status = self._extract_flow_status(message)
+            if parsed_result:
+                rounds[-1]["result"] = parsed_result
+            if parsed_status:
+                rounds[-1]["status"] = parsed_status
+
+        return rounds
+
+    def _format_round_table(self, rounds: list[dict[str, Any]]) -> str:
+        header = "| 轮次 | A | B | C | 结果 |\n| --- | --- | --- | --- | --- |"
+        rows = [
+            f"| 第{row['round']}轮 | {row['A'] or '-'} | {row['B'] or '-'} | {row['C'] or '-'} | {row['result'] or '-'} |"
+            for row in rounds
+        ]
+        return "\n".join([header, *rows])
 
     def _resolve_start_node(self, definition: FlowDefinition):
         explicit_start = next((node for node in definition.nodes if isinstance(node, StartNode)), None)
@@ -819,11 +1049,21 @@ class FlowRunner:
         # LLM 分类
         if condition_type == "llm_classify" and data.llm_config:
             config = data.llm_config
-            # 简化实现：返回第一个匹配的类别（实际应调用 LLM）
-            categories = config.categories or []
-            for branch in data.branches:
-                if branch.condition_value in categories:
-                    return branch.id
+            categories = [branch.condition_value for branch in data.branches if branch.condition_value]
+            if categories:
+                result = invoke_text_classification(
+                    text=str(input_value or ""),
+                    categories=categories,
+                    prompt=config.prompt,
+                    model=config.model,
+                    temperature=0,
+                )
+                runtime_context.setdefault("condition_results", {})[node.id] = result
+                matched_category = result.get("category")
+                if matched_category:
+                    for branch in data.branches:
+                        if branch.condition_value == matched_category:
+                            return branch.id
             return data.default_branch_id or (data.branches[0].id if data.branches else "false")
 
         # 正则匹配
@@ -874,8 +1114,29 @@ class FlowRunner:
     def _build_final_output(self, runtime_context: dict, steps: list[RunStepResult]) -> dict:
         if steps:
             last = steps[-1]
+            last_message = last.output.get("result", {}).get("message", "") if isinstance(last.output, dict) else ""
+            rounds = self._build_round_summary(steps)
+            user_message = str(runtime_context.get("input", {}).get("user_message") or "")
+
+            if rounds:
+                all_ties = all((row.get("result") or "") == "平局" for row in rounds)
+                final_round = rounds[-1]
+                if "平局" in user_message:
+                    answer = f"是，{len(rounds)} 轮全部平局。" if all_ties else f"不是，第{final_round['round']}轮已经分出结果：{final_round.get('result') or '非平局'}。"
+                else:
+                    answer = f"共进行了 {len(rounds)} 轮；最终结果：{final_round.get('result') or '未判定'}。"
+
+                return {
+                    "final_text": f"{answer}\n\n{self._format_round_table(rounds)}",
+                    "summary": answer,
+                    "rounds": rounds,
+                    "last_step_node_id": last.node_id,
+                    "steps_count": len(steps),
+                    "step_outputs": runtime_context.get("steps", {}),
+                }
+
             return {
-                "final_text": last.output.get("result", {}).get("message", ""),
+                "final_text": last_message,
                 "last_step_node_id": last.node_id,
                 "steps_count": len(steps),
                 "step_outputs": runtime_context.get("steps", {}),

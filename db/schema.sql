@@ -5,6 +5,8 @@ create table if not exists flows (
   owner_user_id varchar(64),
   workspace_id varchar(64),
   status varchar(32) not null default 'draft',
+  is_exposed boolean not null default false,
+  is_primary boolean not null default false,
   latest_version integer not null default 1,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
