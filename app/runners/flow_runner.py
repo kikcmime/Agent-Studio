@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Iterator
 from datetime import datetime
-import re
 from typing import Any
 from uuid import uuid4
 
-from app.core.llm import invoke_text_classification
+from app.core.llm import _strip_control_markup_progressively
 from app.repositories.factory import get_store
 from app.runners.agent_runner import agent_runner
+from app.runners import flow_runtime
 from app.schemas.contracts import (
     AgentNode,
     ConditionNode,
@@ -96,7 +95,7 @@ class FlowRunner:
                             started_at=now,
                             finished_at=failed_at,
                             input={},
-                            output=self._build_failed_output(request_input, steps),
+                            output=self._build_failed_output(request.input, steps),
                             error=f"agent {node.data.agent_binding.agent_id} not found",
                         )
                     )
@@ -145,7 +144,7 @@ class FlowRunner:
                             started_at=started_at,
                             finished_at=failed_at,
                             input=resolved_input,
-                            output=self._build_failed_output(request_input, steps),
+                            output=self._build_failed_output(request.input, steps),
                             error=str(exc),
                         )
                     )
@@ -436,10 +435,18 @@ class FlowRunner:
                     return
 
                 output: dict[str, Any] | None = None
+                streamed_text = ""
+                visible_text = ""
                 try:
                     for item in agent_runner.stream(agent, resolved_input):
                         if item.get("type") == "delta":
-                            yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": item.get("delta", "")}
+                            streamed_text += str(item.get("delta", ""))
+                            next_visible_text = _strip_control_markup_progressively(streamed_text)
+                            if len(next_visible_text) > len(visible_text):
+                                delta = next_visible_text[len(visible_text) :]
+                                visible_text = next_visible_text
+                                if delta:
+                                    yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": delta}
                         elif item.get("type") == "completed":
                             output = item.get("output") or {}
                 except Exception as exc:
@@ -549,10 +556,18 @@ class FlowRunner:
 
                     member_output: dict[str, Any] | None = None
                     member_input = self._inject_team_member_context(node.id, agent.name, resolved_input, runtime_context)
+                    member_streamed_text = ""
+                    member_visible_text = ""
                     try:
                         for item in agent_runner.stream(agent, member_input):
                             if item.get("type") == "delta":
-                                yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": item.get("delta", "")}
+                                member_streamed_text += str(item.get("delta", ""))
+                                next_visible_text = _strip_control_markup_progressively(member_streamed_text)
+                                if len(next_visible_text) > len(member_visible_text):
+                                    delta = next_visible_text[len(member_visible_text) :]
+                                    member_visible_text = next_visible_text
+                                    if delta:
+                                        yield "token.delta", {"run_id": run_id, "node_id": node.id, "delta": delta}
                             elif item.get("type") == "completed":
                                 member_output = item.get("output") or {}
                     except Exception as exc:
@@ -629,100 +644,22 @@ class FlowRunner:
         yield "run.completed", detail.model_dump(mode="json")
 
     def _save_stream_run(self, detail: RunDetail) -> None:
-        if hasattr(self.store, "save_run"):
-            self.store.save_run(detail)
-        else:
-            self.store.runs[detail.id] = detail
+        flow_runtime.save_stream_run(self.store, detail)
 
     def _resolve_team_member_ids(self, node: TeamNode) -> list[str]:
-        if node.data.member_agent_ids:
-            return node.data.member_agent_ids
-
-        if node.data.team_id and hasattr(self.store, "get_team"):
-            team = self.store.get_team(node.data.team_id)
-            if team:
-                return team.member_agent_ids
-
-        return []
+        return flow_runtime.resolve_team_member_ids(self.store, node)
 
     def _empty_team_output(self, node: TeamNode) -> dict[str, Any]:
-        return {
-            "mode": "team",
-            "strategy": node.data.strategy,
-            "team_id": node.data.team_id,
-            "member_agent_ids": self._resolve_team_member_ids(node),
-            "member_results": [],
-            "message": "",
-        }
+        return flow_runtime.empty_team_output(self.store, node)
 
     def _build_team_output(self, node: TeamNode, member_results: list[dict[str, Any]]) -> dict[str, Any]:
-        messages: list[str] = []
-        for result in member_results:
-            agent_name = result.get("agent_name") or result.get("agent_id") or "Agent"
-            message = result.get("message") or ""
-            if message:
-                messages.append(f"{agent_name}: {message}")
-
-        if not messages and member_results:
-            messages.append("Team 已执行完成，但成员 Agent 没有返回文本结果。")
-        if not member_results:
-            messages.append("Team 没有绑定可执行的成员 Agent。")
-
-        return {
-            "mode": "team",
-            "strategy": node.data.strategy,
-            "team_id": node.data.team_id,
-            "member_agent_ids": self._resolve_team_member_ids(node),
-            "member_results": member_results,
-            "message": "\n\n".join(messages),
-        }
+        return flow_runtime.build_team_output(self.store, node, member_results)
 
     def _run_team_node(self, node: TeamNode, resolved_input: dict[str, Any], runtime_context: dict) -> dict[str, Any]:
-        member_results: list[dict[str, Any]] = []
-
-        for member_agent_id in self._resolve_team_member_ids(node):
-            agent = self.store.get_agent(member_agent_id)
-            if not agent:
-                member_results.append(
-                    {
-                        "agent_id": member_agent_id,
-                        "agent_name": member_agent_id,
-                        "status": "failed",
-                        "message": f"Agent {member_agent_id} not found.",
-                    }
-                )
-                continue
-
-            try:
-                member_input = self._inject_team_member_context(node.id, agent.name, resolved_input, runtime_context)
-                output = agent_runner.run(agent, member_input)
-                member_results.append(
-                    {
-                        "agent_id": member_agent_id,
-                        "agent_name": agent.name,
-                        "status": "completed",
-                        "output": output,
-                        "message": output.get("message", ""),
-                    }
-                )
-            except Exception as exc:
-                member_results.append(
-                    {
-                        "agent_id": member_agent_id,
-                        "agent_name": agent.name,
-                        "status": "failed",
-                        "message": f"执行失败：{exc}",
-                        "error": str(exc),
-                    }
-                )
-
-        return self._build_team_output(node, member_results)
+        return flow_runtime.run_team_node(self.store, node, resolved_input, runtime_context)
 
     def _build_edges_by_source(self, edges: list[FlowEdge]) -> dict[str, list[FlowEdge]]:
-        edges_by_source: dict[str, list[FlowEdge]] = defaultdict(list)
-        for edge in edges:
-            edges_by_source[edge.source].append(edge)
-        return edges_by_source
+        return flow_runtime.build_edges_by_source(edges)
 
     def _resolve_retry_target(
         self,
@@ -731,20 +668,17 @@ class FlowRunner:
         on_fail: str | None,
         runtime_context: dict,
     ) -> str | None:
-        if not on_fail or max_retry <= 0:
-            return None
-
-        retry_counts = runtime_context.setdefault("retry_counts", {})
-        current_count = retry_counts.get(node_id, 0)
-
-        if current_count >= max_retry:
-            return None
-
-        retry_counts[node_id] = current_count + 1
-        return on_fail
+        return flow_runtime.resolve_retry_target(node_id, max_retry, on_fail, runtime_context)
 
     def _output_requests_retry(self, output: dict[str, Any]) -> bool:
-        status = str(output.get("status") or output.get("flow_status") or "").strip().lower()
+        control = output.get("control") if isinstance(output.get("control"), dict) else {}
+        status = str(
+            control.get("status")
+            or control.get("flow_status")
+            or output.get("status")
+            or output.get("flow_status")
+            or ""
+        ).strip().lower()
         if status in {"fail", "failed", "retry"}:
             return True
 
@@ -753,73 +687,16 @@ class FlowRunner:
         return any(marker in message for marker in retry_markers)
 
     def _current_round(self, runtime_context: dict) -> int:
-        retry_counts = runtime_context.get("retry_counts") or {}
-        numeric_counts = [int(value or 0) for value in retry_counts.values()]
-        return max([0, *numeric_counts]) + 1
+        return flow_runtime.current_round(runtime_context)
 
     def _inject_round_context(self, node_id: str, resolved_input: dict, runtime_context: dict) -> dict:
-        if runtime_context.get("flow_id") != "flow_rps_team":
-            return resolved_input
-
-        enriched = dict(resolved_input)
-        current_round = self._current_round(runtime_context)
-        round_label = f"第{current_round}轮"
-        enriched.setdefault("current_round", current_round)
-        enriched.setdefault("round_label", round_label)
-
-        user_message = str(enriched.get("user_message") or "").strip()
-        if node_id == "rps_host":
-            enriched["user_message"] = f"{user_message}\n当前轮次：{round_label}。请只输出：{round_label}开始。".strip()
-        elif user_message and round_label not in user_message:
-            enriched["user_message"] = f"{user_message}\n当前轮次：{round_label}。"
-        return enriched
+        return flow_runtime.inject_round_context(node_id, resolved_input, runtime_context)
 
     def _inject_team_member_context(self, node_id: str, agent_name: str, resolved_input: dict, runtime_context: dict) -> dict:
-        if runtime_context.get("flow_id") != "flow_rps_team" or node_id != "rps_players":
-            return resolved_input
-
-        enriched = dict(resolved_input)
-        current_round = self._current_round(runtime_context)
-        round_label = f"第{current_round}轮"
-        base_message = str(enriched.get("user_message") or "").strip()
-        if current_round > 1:
-            extra = f"当前轮次：{round_label}。\n你是{agent_name}。\n这是平局重开轮次，请只输出一个选择，并尽量避免与其他玩家完全一样。"
-        else:
-            extra = f"当前轮次：{round_label}。\n你是{agent_name}。请只输出一个选择。"
-        enriched["user_message"] = f"{base_message}\n{extra}".strip()
-        enriched["current_round"] = current_round
-        enriched["round_label"] = round_label
-        return enriched
+        return flow_runtime.inject_team_member_context(node_id, agent_name, resolved_input, runtime_context)
 
     def _build_failed_output(self, request_input: dict, steps: list[RunStepResult]) -> dict[str, Any]:
-        rounds = self._build_round_summary(steps)
-        if rounds:
-            final_round = rounds[-1]
-            summary = f"共进行了 {len(rounds)} 轮；仍未分出胜负，已达到最大重试次数。最后一轮结果：{final_round.get('result') or '未判定'}。"
-            return {
-                "final_text": f"{summary}\n\n{self._format_round_table(rounds)}",
-                "summary": summary,
-                "rounds": rounds,
-                "steps_count": len(steps),
-                "step_outputs": {step.node_id: step.output for step in steps},
-                "failed": True,
-            }
-
-        last_message = ""
-        if steps:
-            last_step = steps[-1]
-            if isinstance(last_step.output, dict):
-                last_result = last_step.output.get("result") or {}
-                if isinstance(last_result, dict):
-                    last_message = str(last_result.get("message") or "")
-        summary = last_message or "执行失败，已达到最大重试次数。"
-        return {
-            "final_text": summary,
-            "summary": summary,
-            "steps_count": len(steps),
-            "step_outputs": {step.node_id: step.output for step in steps},
-            "failed": True,
-        }
+        return flow_runtime.build_failed_output(request_input, steps)
 
     def _build_failed_run(
         self,
@@ -832,113 +709,30 @@ class FlowRunner:
         steps: list[RunStepResult],
         events: list[RunEvent],
     ) -> RunDetail:
-        events.append(
-            RunEvent(
-                id=f"event_{uuid4().hex[:10]}",
-                run_id=run_id,
-                event_type="run.failed",
-                created_at=finished_at,
-                payload={"reason": "retry_exhausted_or_no_failure_route"},
-            )
+        return flow_runtime.build_failed_run(
+            run_id, flow_id, flow_version, request_input, started_at, finished_at, steps, events
         )
-        return RunDetail(
-            id=run_id,
-            flow_id=flow_id,
-            flow_version=flow_version,
-            status=RunStatus.FAILED,
-            input=request_input,
-            output={},
-            started_at=started_at,
-            finished_at=finished_at,
-            steps=steps,
-            events=events,
-        )
+
+    def _resolve_failed_reason(self, steps: list[RunStepResult]) -> str:
+        return flow_runtime.resolve_failed_reason(steps)
 
     def _extract_rps_choice(self, value: Any) -> str:
-        if not isinstance(value, str):
-            return ""
-        match = re.search(r"(剪刀|石头|布)", value)
-        return match.group(1) if match else ""
+        return flow_runtime.extract_rps_choice(value)
 
     def _extract_rps_result(self, value: Any) -> str:
-        if not isinstance(value, str):
-            return ""
-        match = re.search(r"结果\s*[=:：]\s*([^\n]+)", value)
-        if match:
-            return match.group(1).strip()
-        if "平局" in value:
-            return "平局"
-        return ""
+        return flow_runtime.extract_rps_result(value)
 
     def _extract_flow_status(self, value: Any) -> str:
-        if not isinstance(value, str):
-            return ""
-        match = re.search(r"flow_status\s*[:=：]\s*(success|fail|failed|retry)", value, flags=re.IGNORECASE)
-        return match.group(1).lower() if match else ""
+        return flow_runtime.extract_flow_status(value)
 
     def _build_round_summary(self, steps: list[RunStepResult]) -> list[dict[str, Any]]:
-        rounds: list[dict[str, Any]] = []
-
-        for step in steps:
-            result = step.output.get("result", {}) if isinstance(step.output, dict) else {}
-            if step.node_type == "team" and isinstance(result, dict) and result.get("mode") == "team":
-                row = {
-                    "round": len(rounds) + 1,
-                    "A": "",
-                    "B": "",
-                    "C": "",
-                    "result": "",
-                    "status": "",
-                }
-                for member in result.get("member_results", []):
-                    if not isinstance(member, dict):
-                        continue
-                    agent_name = str(member.get("agent_name") or "")
-                    message = member.get("message") or member.get("output", {}).get("message") or ""
-                    choice = self._extract_rps_choice(message)
-                    if "玩家 A" in agent_name or "玩家A" in agent_name:
-                        row["A"] = choice
-                    elif "玩家 B" in agent_name or "玩家B" in agent_name:
-                        row["B"] = choice
-                    elif "玩家 C" in agent_name or "玩家C" in agent_name:
-                        row["C"] = choice
-                rounds.append(row)
-                continue
-
-            if not rounds or step.node_type != "agent" or not isinstance(result, dict):
-                continue
-
-            message = result.get("message", "")
-            parsed_result = self._extract_rps_result(message)
-            parsed_status = self._extract_flow_status(message)
-            if parsed_result:
-                rounds[-1]["result"] = parsed_result
-            if parsed_status:
-                rounds[-1]["status"] = parsed_status
-
-        return rounds
+        return flow_runtime.build_round_summary(steps)
 
     def _format_round_table(self, rounds: list[dict[str, Any]]) -> str:
-        header = "| 轮次 | A | B | C | 结果 |\n| --- | --- | --- | --- | --- |"
-        rows = [
-            f"| 第{row['round']}轮 | {row['A'] or '-'} | {row['B'] or '-'} | {row['C'] or '-'} | {row['result'] or '-'} |"
-            for row in rounds
-        ]
-        return "\n".join([header, *rows])
+        return flow_runtime.format_round_table(rounds)
 
     def _resolve_start_node(self, definition: FlowDefinition):
-        explicit_start = next((node for node in definition.nodes if isinstance(node, StartNode)), None)
-        if explicit_start:
-            return explicit_start
-
-        targets = set()
-        for edge in definition.edges:
-            targets.add(edge.target)
-
-        start_nodes = [node for node in definition.nodes if node.id not in targets]
-        if not start_nodes:
-            return definition.nodes[0] if definition.nodes else None
-        return start_nodes[0]
+        return flow_runtime.resolve_start_node(definition)
 
     def _select_next_node(
         self,
@@ -947,201 +741,22 @@ class FlowRunner:
         node_map: dict[str, Any],
         branch: str | None = None,
     ):
-        edges = edges_by_source.get(node_id) or []
-        if not edges:
-            return None
-
-        # 如果有分支ID，优先匹配分支
-        if branch is not None:
-            # 先尝试匹配 branch_id
-            for edge in edges:
-                edge_branch = edge.data.get("branch") if edge.data else None
-                if edge_branch == branch:
-                    return node_map.get(edge.target)
-            # 兼容旧逻辑：匹配 true/false
-            preferred_handles = ["true", "false"] if branch in ("true", True) else ["false", "true"]
-            for handle in preferred_handles:
-                for edge in edges:
-                    edge_handle = (edge.source_handle or edge.data.get("branch") or "").lower()
-                    if edge_handle == handle:
-                        return node_map.get(edge.target)
-
-        return node_map.get(edges[0].target)
+        return flow_runtime.select_next_node(node_id, edges_by_source, node_map, branch)
 
     def _resolve_input_mapping(self, mapping: dict, runtime_context: dict) -> dict:
-        if not mapping:
-            return dict(runtime_context.get("input") or {})
-
-        resolved: dict = {}
-        for key, value in mapping.items():
-            if isinstance(value, str) and value.startswith("{{input.") and value.endswith("}}"):
-                field = value.removeprefix("{{input.").removesuffix("}}")
-                resolved[key] = runtime_context.get("input", {}).get(field)
-            elif isinstance(value, str) and value.startswith("{{steps.") and value.endswith("}}"):
-                path = value.removeprefix("{{steps.").removesuffix("}}").split(".")
-                current = runtime_context.get("steps", {})
-                for part in path:
-                    if isinstance(current, dict):
-                        current = current.get(part)
-                    else:
-                        current = None
-                        break
-                resolved[key] = current
-            else:
-                resolved[key] = value
-        source_input = runtime_context.get("input", {})
-        for passthrough_key in ("messages", "session_id"):
-            if passthrough_key in source_input and passthrough_key not in resolved:
-                resolved[passthrough_key] = source_input[passthrough_key]
-        return resolved
+        return flow_runtime.resolve_input_mapping(mapping, runtime_context)
 
     def _resolve_context_value(self, expression: str, runtime_context: dict):
-        if expression.startswith("input."):
-            field = expression.removeprefix("input.")
-            return runtime_context.get("input", {}).get(field)
-        if expression.startswith("steps."):
-            path = expression.removeprefix("steps.").split(".")
-            current = runtime_context.get("steps", {})
-            for part in path:
-                if isinstance(current, dict):
-                    current = current.get(part)
-                else:
-                    return None
-            return current
-        return runtime_context.get(expression)
+        return flow_runtime.resolve_context_value(expression, runtime_context)
 
     def _evaluate_condition(self, node: ConditionNode, runtime_context: dict) -> str:
-        """评估条件节点，返回匹配的分支ID"""
-        data = node.data
-        condition_type = data.condition_type or "simple"
-
-        # 获取输入值
-        input_value = self._resolve_context_value(
-            data.input_source.replace("{{", "").replace("}}", ""),
-            runtime_context
-        )
-
-        # 简单条件（兼容旧版本）
-        if condition_type == "simple" and data.condition:
-            rule = data.condition
-            actual = self._resolve_context_value(rule.field, runtime_context)
-            expected = rule.value
-            matched = self._match_simple_condition(actual, expected, rule.operator)
-            return "true" if matched else "false"
-
-        # 表达式条件
-        if condition_type == "expression" and data.expression:
-            # 简单表达式求值（替换变量后比较）
-            expr = data.expression
-            # 替换 {{xxx}} 变量
-            import re
-            def replace_var(m):
-                var_path = m.group(1).strip()
-                return str(self._resolve_context_value(var_path, runtime_context) or "")
-            expr = re.sub(r'\{\{([^}]+)\}\}', replace_var, expr)
-            try:
-                # 安全求值：只支持基本比较
-                matched = eval(expr, {"__builtins__": {}}, {})
-                return "true" if matched else "false"
-            except:
-                return data.default_branch_id or "false"
-
-        # LLM 分类
-        if condition_type == "llm_classify" and data.llm_config:
-            config = data.llm_config
-            categories = [branch.condition_value for branch in data.branches if branch.condition_value]
-            if categories:
-                result = invoke_text_classification(
-                    text=str(input_value or ""),
-                    categories=categories,
-                    prompt=config.prompt,
-                    model=config.model,
-                    temperature=0,
-                )
-                runtime_context.setdefault("condition_results", {})[node.id] = result
-                matched_category = result.get("category")
-                if matched_category:
-                    for branch in data.branches:
-                        if branch.condition_value == matched_category:
-                            return branch.id
-            return data.default_branch_id or (data.branches[0].id if data.branches else "false")
-
-        # 正则匹配
-        if condition_type == "regex" and data.regex_patterns:
-            import re
-            text = str(input_value or "")
-            for pattern_obj in data.regex_patterns:
-                try:
-                    if re.search(pattern_obj.pattern, text):
-                        return pattern_obj.branch_id
-                except re.error:
-                    continue
-            return data.default_branch_id or "false"
-
-        # JSON Schema 校验
-        if condition_type == "json_schema" and data.json_schema:
-            # 简化实现：只检查必需字段是否存在
-            schema = data.json_schema
-            required = schema.get("required", [])
-            if isinstance(input_value, dict):
-                missing = [f for f in required if f not in input_value]
-                return "valid" if not missing else "invalid"
-            return "invalid"
-
-        # 默认走第一个分支
-        return data.default_branch_id or (data.branches[0].id if data.branches else "true")
+        return flow_runtime.evaluate_condition(node, runtime_context)
 
     def _match_simple_condition(self, actual, expected, operator: str) -> bool:
-        """简单条件匹配"""
-        if operator == "eq":
-            return actual == expected
-        if operator == "ne":
-            return actual != expected
-        if operator == "contains":
-            return expected in actual if actual is not None else False
-        if operator == "gt":
-            return actual > expected if actual is not None else False
-        if operator == "gte":
-            return actual >= expected if actual is not None else False
-        if operator == "lt":
-            return actual < expected if actual is not None else False
-        if operator == "lte":
-            return actual <= expected if actual is not None else False
-        if operator == "exists":
-            return actual is not None
-        return False
+        return flow_runtime.match_simple_condition(actual, expected, operator)
 
     def _build_final_output(self, runtime_context: dict, steps: list[RunStepResult]) -> dict:
-        if steps:
-            last = steps[-1]
-            last_message = last.output.get("result", {}).get("message", "") if isinstance(last.output, dict) else ""
-            rounds = self._build_round_summary(steps)
-            user_message = str(runtime_context.get("input", {}).get("user_message") or "")
-
-            if rounds:
-                all_ties = all((row.get("result") or "") == "平局" for row in rounds)
-                final_round = rounds[-1]
-                if "平局" in user_message:
-                    answer = f"是，{len(rounds)} 轮全部平局。" if all_ties else f"不是，第{final_round['round']}轮已经分出结果：{final_round.get('result') or '非平局'}。"
-                else:
-                    answer = f"共进行了 {len(rounds)} 轮；最终结果：{final_round.get('result') or '未判定'}。"
-
-                return {
-                    "final_text": f"{answer}\n\n{self._format_round_table(rounds)}",
-                    "summary": answer,
-                    "rounds": rounds,
-                    "last_step_node_id": last.node_id,
-                    "steps_count": len(steps),
-                    "step_outputs": runtime_context.get("steps", {}),
-                }
-
-            return {
-                "final_text": last_message,
-                "last_step_node_id": last.node_id,
-                "steps_count": len(steps),
-                "step_outputs": runtime_context.get("steps", {}),
-            }
-        return {"final_text": "", "steps_count": 0}
+        return flow_runtime.build_final_output(runtime_context, steps)
 
 
 flow_runner = FlowRunner()

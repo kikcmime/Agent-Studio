@@ -60,6 +60,11 @@ def _build_client(provider: str, timeout_seconds: int) -> tuple[str, str, OpenAI
 def build_messages(agent: AgentDetail, resolved_input: dict[str, Any]) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
     system_parts = [part for part in [agent.role, agent.system_prompt, agent.instructions] if part]
+    system_parts.append(
+        "When you need to signal workflow control, append a final tag exactly like "
+        "<agent_studio_control>{\"flow_status\":\"success|fail|retry\",\"status\":\"success|fail|retry\",\"result\":\"short result\"}</agent_studio_control>. "
+        "Keep the tag on its own line, and keep the user-facing answer outside the tag."
+    )
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
@@ -102,8 +107,46 @@ def _build_request(agent: AgentDetail, resolved_input: dict[str, Any]) -> tuple[
     return provider, model_name, {"client": client, "kwargs": request_kwargs}
 
 
+def _extract_embedded_control_payload(text: str) -> tuple[dict[str, Any], str]:
+    match = re.search(
+        r"<agent_studio_control>\s*(\{.*?\})\s*</agent_studio_control>",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return {}, text
+
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        payload = {}
+
+    cleaned_text = re.sub(
+        r"\n?<agent_studio_control>\s*\{.*?\}\s*</agent_studio_control>\s*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    return payload if isinstance(payload, dict) else {}, cleaned_text
+
+
+def _strip_control_markup_progressively(text: str) -> str:
+    cleaned_text = re.sub(
+        r"<agent_studio_control>\s*\{.*?\}\s*</agent_studio_control>\s*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    partial_tag_match = re.search(r"<agent_studio_control[\s\S]*$", cleaned_text, flags=re.IGNORECASE)
+    if partial_tag_match:
+        cleaned_text = cleaned_text[: partial_tag_match.start()]
+    return cleaned_text
+
+
 def _extract_flow_directives(message: str) -> dict[str, Any]:
     text = (message or "").strip()
+    control_payload, cleaned_text = _extract_embedded_control_payload(text)
+    text = cleaned_text or text
     lowered = text.lower()
 
     flow_status_match = re.search(
@@ -118,9 +161,21 @@ def _extract_flow_directives(message: str) -> dict[str, Any]:
     )
     result_match = re.search(r"结果\s*[:=：]\s*([^\n；;]+)", text)
 
-    flow_status = flow_status_match.group(1).lower() if flow_status_match else None
-    status = status_match.group(1).lower() if status_match else None
-    result = result_match.group(1).strip() if result_match else None
+    flow_status = (
+        str(control_payload.get("flow_status")).lower()
+        if control_payload.get("flow_status") is not None
+        else (flow_status_match.group(1).lower() if flow_status_match else None)
+    )
+    status = (
+        str(control_payload.get("status")).lower()
+        if control_payload.get("status") is not None
+        else (status_match.group(1).lower() if status_match else None)
+    )
+    result = (
+        str(control_payload.get("result")).strip()
+        if control_payload.get("result") is not None
+        else (result_match.group(1).strip() if result_match else None)
+    )
 
     # Demo-safe normalization:
     # if the model explicitly says the result is a draw, a contradictory
@@ -139,6 +194,8 @@ def _extract_flow_directives(message: str) -> dict[str, Any]:
         "status": status,
         "result": result,
         "is_draw": "平局" in lowered or "平局" in text,
+        "clean_message": text,
+        "control": control_payload,
     }
 
 
@@ -246,11 +303,12 @@ def invoke_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> dict
         "agent_name": agent.name,
         "provider": provider,
         "model": model_name,
-        "message": message,
+        "message": directives["clean_message"],
         "flow_status": directives["flow_status"],
         "status": directives["status"],
         "result": directives["result"],
         "is_draw": directives["is_draw"],
+        "control": directives["control"],
         "echo_input": resolved_input,
         "normalized_task": (resolved_input.get("user_message") or resolved_input.get("query") or "")[:120],
         "finish_reason": finish_reason,
@@ -263,6 +321,7 @@ def stream_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> Iter
     client = request["client"]
     request_kwargs = {**request["kwargs"], "stream": True}
     message_parts: list[str] = []
+    visible_prefix = ""
     finish_reason = None
 
     for chunk in client.chat.completions.create(**request_kwargs):
@@ -275,7 +334,12 @@ def stream_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> Iter
         if not delta:
             continue
         message_parts.append(delta)
-        yield {"type": "delta", "delta": delta}
+        visible_text = _strip_control_markup_progressively("".join(message_parts))
+        if len(visible_text) > len(visible_prefix):
+            next_delta = visible_text[len(visible_prefix) :]
+            visible_prefix = visible_text
+            if next_delta:
+                yield {"type": "delta", "delta": next_delta}
 
     message = "".join(message_parts)
     directives = _extract_flow_directives(message)
@@ -286,11 +350,12 @@ def stream_agent_llm(agent: AgentDetail, resolved_input: dict[str, Any]) -> Iter
             "agent_name": agent.name,
             "provider": provider,
             "model": model_name,
-            "message": message,
+            "message": directives["clean_message"],
             "flow_status": directives["flow_status"],
             "status": directives["status"],
             "result": directives["result"],
             "is_draw": directives["is_draw"],
+            "control": directives["control"],
             "echo_input": resolved_input,
             "normalized_task": (resolved_input.get("user_message") or resolved_input.get("query") or "")[:120],
             "finish_reason": finish_reason,
