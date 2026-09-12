@@ -101,8 +101,15 @@ def _build_request(agent: AgentDetail, resolved_input: dict[str, Any]) -> tuple[
     if llm_config.temperature is not None:
         request_kwargs["temperature"] = llm_config.temperature
 
-    if "max_tokens" in llm_config.extra:
-        request_kwargs["max_tokens"] = llm_config.extra["max_tokens"]
+    extra = llm_config.extra or {}
+    if "max_tokens" in extra:
+        request_kwargs["max_tokens"] = extra["max_tokens"]
+
+    # 透传非 max_tokens 的扩展字段（如 thinking、top_p）到 extra_body，
+    # 用于关闭推理模型的思考阶段等场景。
+    extra_body = {key: value for key, value in extra.items() if key != "max_tokens"}
+    if extra_body:
+        request_kwargs["extra_body"] = extra_body
 
     return provider, model_name, {"client": client, "kwargs": request_kwargs}
 
@@ -235,7 +242,6 @@ def invoke_text_classification(
             {"role": "user", "content": user_prompt},
         ],
         temperature=temperature,
-        max_tokens=24,
     )
 
     choice = response.choices[0] if response.choices else None
